@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+tests
+test_e2e.py
+reset_db.py
+opencode.json
+**/__pycache__
