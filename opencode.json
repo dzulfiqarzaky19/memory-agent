@@ -3,7 +3,7 @@
   "mcp": {
     "memory": {
       "type": "local",
-      "command": ["python", "memory_mcp.py"],
+      "command": ["docker", "exec", "-i", "memory-agent-app", "python", "memory_mcp.py"],
       "enabled": true
     }
   }

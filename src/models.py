@@ -33,12 +33,15 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     user_id: str = Field(..., min_length=1)
     top_k: int = Field(default=10, ge=1, le=100)
+    agent_id: Optional[str] = None
 
 
 class MemoryResult(BaseModel):
     id: str
     text: str
     score: float
+    type: Optional[str] = None
+    priority: Optional[int] = None
     created_at: datetime
     metadata: Optional[dict] = None
 

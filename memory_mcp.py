@@ -19,7 +19,10 @@ async def search_memories(user_id: str, query: str) -> str:
         data = r.json()
     if not data["results"]:
         return "No relevant memories found."
-    lines = [f"- [{m['score']:.4f}] {m['text']}" for m in data["results"]]
+    lines = [
+        f"- [{m['score']:.4f}] ({m.get('type') or 'memory'}) {m['text']}"
+        for m in data["results"]
+    ]
     return "Relevant memories:\n" + "\n".join(lines)
 
 
@@ -49,7 +52,7 @@ async def store_memories(user_id: str, messages: str) -> str:
 @MCP.tool()
 async def get_persona(user_id: str) -> str:
     """Get the user's persona summary."""
-    async with httpx.AsyncClient(timeout=10) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         r = await c.get(f"{API_BASE}/persona/{user_id}")
         r.raise_for_status()
         data = r.json()

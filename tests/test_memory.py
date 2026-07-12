@@ -34,6 +34,25 @@ async def test_scenarios_empty(engine):
 
 
 @pytest.mark.asyncio
+async def test_priority_and_instruction_recall(engine):
+    uid = "test-priority-recall"
+    emb = engine.embedder.embed(["x"])[0]
+
+    # Identical embeddings -> ranking decided by priority tilt.
+    await engine.storage.save_memory(uid, "Low priority fact", emb, priority=10)
+    await engine.storage.save_memory(uid, "High priority fact", emb, priority=95)
+    await engine.storage.save_memory(uid, "Never use emojis", emb, mem_type="instruction", priority=90)
+
+    results = await engine.search(uid, "fact", top_k=10)
+    texts = [r["text"] for r in results]
+
+    # Instruction is always surfaced even without matching the query.
+    assert "Never use emojis" in texts
+    # Higher-priority fact outranks the lower-priority one.
+    assert texts.index("High priority fact") < texts.index("Low priority fact")
+
+
+@pytest.mark.asyncio
 async def test_persona_empty(engine):
     uid = "test-persona-empty"
     result = await engine.get_persona(uid)

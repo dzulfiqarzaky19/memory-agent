@@ -5,6 +5,7 @@ from typing import Optional
 
 from config import (
     EXTRACTION_EVERY_N_TURNS,
+    PERSONA_EVERY_N_MEMORIES,
     RECALL_MAX_RESULTS,
     RECALL_RRF_K,
     RECALL_SIMILARITY_THRESHOLD,
@@ -19,13 +20,17 @@ logger = logging.getLogger(__name__)
 SCENARIO_REBUILD_INTERVAL = 10
 
 
+def _priority_weight(score: float, priority: Optional[int]) -> float:
+    # Mild priority tilt: priority 50 is neutral (x1.0), 100 -> x1.25, 0 -> x0.75.
+    p = 50 if priority is None else priority
+    return score * (0.75 + p / 200.0)
+
+
 class MemoryEngine:
     def __init__(self, storage: Storage, embedder: EmbeddingProvider, extractor: LLMExtractor):
         self.storage = storage
         self.embedder = embedder
         self.extractor = extractor
-        self._turn_counter: dict[str, int] = {}
-        self._new_memory_counter: dict[str, int] = {}
 
     async def add(
         self,
@@ -43,20 +48,28 @@ class MemoryEngine:
                 metadata=metadata,
             )
 
-        self._turn_counter[user_id] = self._turn_counter.get(user_id, 0) + len(messages)
+        conversations_seen = await self.storage.bump_conversation_counter(
+            user_id, len(messages)
+        )
 
         memories_added = 0
         memory_ids = []
-        if self._turn_counter[user_id] >= EXTRACTION_EVERY_N_TURNS:
-            extracted = await self._extract_and_store(user_id, messages)
+        if conversations_seen >= EXTRACTION_EVERY_N_TURNS:
+            pending = await self.storage.get_recent_conversations(
+                user_id, limit=conversations_seen
+            )
+            extracted = await self._extract_and_store(user_id, pending, agent_id)
             memories_added = len(extracted)
             memory_ids = [m["id"] for m in extracted] if extracted else []
-            self._turn_counter[user_id] = 0
+            await self.storage.reset_conversation_counter(user_id)
 
-            self._new_memory_counter[user_id] = self._new_memory_counter.get(user_id, 0) + memories_added
-            if self._new_memory_counter[user_id] >= SCENARIO_REBUILD_INTERVAL:
-                await self._rebuild_scenarios(user_id)
-                self._new_memory_counter[user_id] = 0
+            if memories_added:
+                memories_since_scenario = await self.storage.bump_scenario_counter(
+                    user_id, memories_added
+                )
+                if memories_since_scenario >= SCENARIO_REBUILD_INTERVAL:
+                    await self._rebuild_scenarios(user_id)
+                    await self.storage.reset_scenario_counter(user_id)
 
         return {
             "memories_added": memories_added,
@@ -68,6 +81,7 @@ class MemoryEngine:
         user_id: str,
         query: str,
         top_k: int = 10,
+        agent_id: Optional[str] = None,
     ) -> list[dict]:
         query_embedding = self.embedder.embed([query])[0]
 
@@ -78,19 +92,28 @@ class MemoryEngine:
                 query_embedding=query_embedding,
                 top_k=top_k,
                 rrf_k=RECALL_RRF_K,
+                agent_id=agent_id,
             )
         elif RECALL_STRATEGY == "keyword":
             memory_results = await self.storage.keyword_search_memories(
                 user_id=user_id,
                 query=query,
                 top_k=top_k,
+                agent_id=agent_id,
             )
         else:
             memory_results = await self.storage.search_memories(
                 user_id=user_id,
                 query_embedding=query_embedding,
                 top_k=top_k,
+                agent_id=agent_id,
             )
+
+        # Priority tilt: high-priority atoms rank above equally-similar low-priority ones.
+        for r in memory_results:
+            r["score"] = round(_priority_weight(r["score"], r.get("priority")), 4)
+
+        existing_ids = {r["id"] for r in memory_results}
 
         scenario_results = await self.storage.search_scenarios(
             user_id=user_id,
@@ -99,34 +122,40 @@ class MemoryEngine:
         )
 
         if scenario_results:
-            scenario_memory_ids = []
-            for s in scenario_results:
-                scenario_memory_ids.extend(s.get("memory_ids", []))
-
-            seen = set()
             unique_ids = []
-            for mid in scenario_memory_ids:
-                if mid not in seen:
-                    seen.add(mid)
-                    unique_ids.append(mid)
+            seen = set()
+            for s in scenario_results:
+                for mid in s.get("memory_ids", []):
+                    if mid not in seen:
+                        seen.add(mid)
+                        unique_ids.append(mid)
 
             if unique_ids:
                 scenario_memories = await self.storage.get_memories_by_ids(unique_ids[:20])
-                existing_ids = {r["id"] for r in memory_results}
                 for sm in scenario_memories:
                     if sm["id"] not in existing_ids:
                         sm["score"] = 0.7
                         sm["metadata"] = sm.get("metadata") or {}
                         sm["metadata"]["_from_scenario"] = True
                         memory_results.append(sm)
+                        existing_ids.add(sm["id"])
 
-            memory_results.sort(key=lambda x: x["score"], reverse=True)
+        # Always surface long-term instructions (behavioral rules), regardless of match.
+        instructions = await self.storage.get_instructions(user_id, agent_id=agent_id, limit=5)
+        for ins in instructions:
+            if ins["id"] not in existing_ids:
+                ins["score"] = round(0.6 + (ins.get("priority") or 50) / 100.0 * 0.4, 4)
+                ins["metadata"] = ins.get("metadata") or {}
+                ins["metadata"]["_instruction"] = True
+                memory_results.append(ins)
+                existing_ids.add(ins["id"])
 
+        memory_results.sort(key=lambda x: x["score"], reverse=True)
         return memory_results[:top_k]
 
     async def get_persona(self, user_id: str) -> dict:
-        memories = await self.storage.get_all_memories(user_id, limit=200)
-        if not memories:
+        count = await self.storage.count_memories(user_id)
+        if count == 0:
             return {
                 "user_id": user_id,
                 "summary": "No memories stored yet.",
@@ -134,14 +163,24 @@ class MemoryEngine:
                 "last_updated": None,
             }
 
-        memory_texts = [m["text"] for m in memories]
-        summary = await self.extractor.generate_persona(memory_texts)
+        cached = await self.storage.get_persona_cache(user_id)
+        if cached and (count - cached["memories_at_generation"]) < PERSONA_EVERY_N_MEMORIES:
+            return {
+                "user_id": user_id,
+                "summary": cached["summary"],
+                "memory_count": count,
+                "last_updated": cached["generated_at"],
+            }
+
+        memories = await self.storage.get_all_memories(user_id, limit=200)
+        summary = await self.extractor.generate_persona([m["text"] for m in memories])
+        generated_at = await self.storage.save_persona_cache(user_id, summary, count)
 
         return {
             "user_id": user_id,
             "summary": summary,
-            "memory_count": len(memories),
-            "last_updated": memories[0]["created_at"] if memories else None,
+            "memory_count": count,
+            "last_updated": generated_at,
         }
 
     async def get_scenarios(self, user_id: str) -> dict:
@@ -169,6 +208,8 @@ class MemoryEngine:
         if not grouped:
             return
 
+        await self.storage.delete_scenarios(user_id)
+
         for group in grouped:
             indices = group.get("memory_indices", [])
             linked_ids = [memory_ids[i] for i in indices if i < len(memory_ids)]
@@ -192,6 +233,7 @@ class MemoryEngine:
         self,
         user_id: str,
         new_messages: list[dict],
+        agent_id: Optional[str] = None,
     ) -> list[dict]:
         messages_text = "\n".join(
             f"{m['role']}: {m['content']}" for m in new_messages
@@ -200,26 +242,36 @@ class MemoryEngine:
         existing = await self.storage.get_all_memories(user_id, limit=50)
         existing_texts = [m["text"] for m in existing]
 
-        extracted_texts = await self.extractor.extract_memories(
+        atoms = await self.extractor.extract_memories(
             messages_text=messages_text,
             existing_memories=existing_texts,
         )
 
-        if not extracted_texts:
+        if not atoms:
             return []
 
-        embeddings = self.embedder.embed(extracted_texts)
+        embeddings = self.embedder.embed([a["content"] for a in atoms])
         stored = []
-        for text, embedding in zip(extracted_texts, embeddings):
+        for atom, embedding in zip(atoms, embeddings):
             row_id = await self.storage.save_memory(
                 user_id=user_id,
-                text=text,
+                text=atom["content"],
                 embedding=embedding,
+                mem_type=atom["type"],
+                priority=atom["priority"],
+                agent_id=agent_id,
             )
             if row_id is None:
-                logger.debug(f"Skipping duplicate: {text[:50]}")
+                logger.debug(f"Skipping duplicate: {atom['content'][:50]}")
                 continue
-            stored.append({"id": row_id, "text": text})
+            stored.append(
+                {
+                    "id": row_id,
+                    "text": atom["content"],
+                    "type": atom["type"],
+                    "priority": atom["priority"],
+                }
+            )
 
         logger.info(f"Extracted {len(stored)} new memories for {user_id}")
         return stored

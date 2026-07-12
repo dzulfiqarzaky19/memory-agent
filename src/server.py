@@ -78,6 +78,7 @@ async def search_memories(req: SearchRequest):
         user_id=req.user_id,
         query=req.query,
         top_k=req.top_k,
+        agent_id=req.agent_id,
     )
     return SearchResponse(
         results=[
@@ -85,6 +86,8 @@ async def search_memories(req: SearchRequest):
                 id=r["id"],
                 text=r["text"],
                 score=r["score"],
+                type=r.get("type"),
+                priority=r.get("priority"),
                 created_at=r["created_at"],
                 metadata=r.get("metadata"),
             )

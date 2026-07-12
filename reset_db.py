@@ -1,4 +1,4 @@
-"""Wipe all data from conversations, memories, and scenarios tables."""
+"""Wipe all data from conversations, memories, scenarios, and cadence tables."""
 import asyncio
 import os
 import sys
@@ -11,9 +11,11 @@ import asyncpg
 
 async def main():
     conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("TRUNCATE conversations, memories, scenarios")
+    await conn.execute(
+        "TRUNCATE conversations, memories, scenarios, extraction_state, personas"
+    )
     await conn.close()
-    print("All data wiped from conversations, memories, scenarios.")
+    print("All data wiped.")
 
 if __name__ == "__main__":
     asyncio.run(main())

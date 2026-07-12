@@ -97,6 +97,39 @@ async def test_scenario_crud(db):
 
 
 @pytest.mark.asyncio
+async def test_typed_memory_and_instructions(db):
+    uid = "test-typed"
+    emb = [0.1] * 768
+
+    await db.save_memory(uid, "Always answer in English", emb, mem_type="instruction", priority=90)
+    await db.save_memory(uid, "User likes hiking", emb, mem_type="persona", priority=70)
+
+    instructions = await db.get_instructions(uid)
+    assert len(instructions) == 1
+    assert instructions[0]["type"] == "instruction"
+    assert instructions[0]["priority"] == 90
+
+    results = await db.search_memories(uid, emb, top_k=10, threshold=0.0)
+    types = {r["text"]: r["type"] for r in results}
+    assert types["User likes hiking"] == "persona"
+
+
+@pytest.mark.asyncio
+async def test_agent_scoping(db):
+    uid = "test-agent-scope"
+    emb = [0.1] * 768
+
+    await db.save_memory(uid, "Shared user fact", emb)  # agent_id NULL -> global
+    await db.save_memory(uid, "Agent-A only fact", emb, agent_id="agent-a")
+    await db.save_memory(uid, "Agent-B only fact", emb, agent_id="agent-b")
+
+    texts_a = {r["text"] for r in await db.search_memories(uid, emb, top_k=10, threshold=0.0, agent_id="agent-a")}
+    assert "Shared user fact" in texts_a
+    assert "Agent-A only fact" in texts_a
+    assert "Agent-B only fact" not in texts_a
+
+
+@pytest.mark.asyncio
 async def test_count_memories(db):
     uid = "test-count"
     emb = [0.1] * 768

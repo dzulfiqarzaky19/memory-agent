@@ -35,7 +35,9 @@ async def db():
     store = Storage(DATABASE_URL)
     await store.initialize()
     async with store._pool.acquire() as conn:
-        await conn.execute("TRUNCATE memories, conversations, scenarios")
+        await conn.execute(
+            "TRUNCATE memories, conversations, scenarios, extraction_state, personas"
+        )
     yield store
     await store.close()
 

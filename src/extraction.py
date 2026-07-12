@@ -10,18 +10,30 @@ from config import LLM_API_KEY, LLM_BASE_URL, LLM_MAX_TOKENS, LLM_MODEL, LLM_PRO
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_TYPES = {"persona", "episodic", "instruction"}
+
 SYSTEM_PROMPT = """You are a memory extraction engine. Given a conversation between a user and an assistant, extract atomic facts that would be useful for personalizing future interactions.
 
+Extract each fact as a concise, self-contained statement with a TYPE and a PRIORITY (0-100).
+
+TYPES:
+- "persona": stable traits, preferences, identity, relationships, tools, habits (e.g. "User prefers dark mode"). Priority 60-100 (health/safety/critical identity facts 80-100).
+- "episodic": objective events, decisions, or ongoing projects (e.g. "User is building a SaaS called Taskflow"). Priority 30-70.
+- "instruction": an explicit long-term rule the user wants the assistant to follow (e.g. "Always answer in English", "Never use emojis", "Call me Alex"). Priority 70-100.
+
 Rules:
-1. Extract facts as concise, self-contained statements
-2. Each fact should be a single, specific piece of information
-3. Include preferences, habits, projects, relationships, tools, and any personal details
-4. Do NOT extract greetings, generic phrases, or transient information
-5. Do NOT update or modify existing facts — only extract NEW facts
-6. Return a JSON object with a "memories" array of strings
+1. Each fact is a single, specific piece of information.
+2. Do NOT extract greetings, small talk, transient one-off requests, or the assistant's own output.
+3. Do NOT repeat facts already in EXISTING MEMORIES.
+4. Only extract NEW facts (ADD-only — never rephrase or update existing ones).
+5. Return a JSON object with a "memories" array of objects: {"content": str, "type": str, "priority": int}.
 
 Example output:
-{"memories": ["User prefers dark mode in VS Code", "User is building a SaaS product called Taskflow", "User uses PostgreSQL for all projects"]}
+{"memories": [
+  {"content": "User prefers dark mode in VS Code", "type": "persona", "priority": 70},
+  {"content": "User is building a SaaS product called Taskflow", "type": "episodic", "priority": 55},
+  {"content": "Always respond in concise bullet points", "type": "instruction", "priority": 85}
+]}
 
 If no extractable facts, return: {"memories": []}"""
 
@@ -41,6 +53,26 @@ def build_extraction_prompt(
     parts.append(new_messages)
     parts.append("\n\nExtract new atomic facts from the conversation above.")
     return "\n".join(parts)
+
+
+def _normalize_atom(m) -> Optional[dict]:
+    # Accept both the typed object format and a bare string (defensive).
+    if isinstance(m, str):
+        content = m.strip()
+        return {"content": content, "type": "episodic", "priority": 50} if content else None
+    if not isinstance(m, dict):
+        return None
+    content = str(m.get("content", "")).strip()
+    if not content:
+        return None
+    mem_type = m.get("type", "episodic")
+    if mem_type not in ALLOWED_TYPES:
+        mem_type = "episodic"
+    try:
+        priority = int(m.get("priority", 50))
+    except (TypeError, ValueError):
+        priority = 50
+    return {"content": content, "type": mem_type, "priority": max(0, min(100, priority))}
 
 
 def _strip_markdown(text: str) -> str:
@@ -64,7 +96,7 @@ class LLMExtractor:
         self,
         messages_text: str,
         existing_memories: Optional[list[str]] = None,
-    ) -> list[str]:
+    ) -> list[dict]:
         user_prompt = build_extraction_prompt(messages_text, existing_memories)
 
         try:
@@ -77,7 +109,7 @@ class LLMExtractor:
             memories = parsed.get("memories", [])
             if not isinstance(memories, list):
                 return []
-            return [m.strip() for m in memories if isinstance(m, str) and m.strip()]
+            return [atom for m in memories if (atom := _normalize_atom(m))]
         except Exception as e:
             logger.error(f"Memory extraction failed: {e}")
             return []
