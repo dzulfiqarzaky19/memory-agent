@@ -26,6 +26,13 @@ function isRealUserEntry(entry) {
   if (entry.type !== "user") return false;
   if (entry.isMeta || entry.isSidechain) return false;
   const content = entry.message && entry.message.content;
+  if (typeof content === "string") {
+    const text = content.trim();
+    // System-injected notices (task-notification, system-reminder, etc.) are
+    // wrapped in a leading XML-ish tag; genuine typed prompts never start with one.
+    if (!text || /^</.test(text)) return false;
+    return true;
+  }
   if (!Array.isArray(content)) return false;
   return content.some((b) => b.type === "text");
 }
