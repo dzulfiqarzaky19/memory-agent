@@ -35,9 +35,8 @@ async def db():
     store = Storage(DATABASE_URL)
     await store.initialize()
     async with store._pool.acquire() as conn:
-        await conn.execute(
-            "TRUNCATE memories, conversations, scenarios, extraction_state, personas"
-        )
+        for table in ("memories", "conversations", "scenarios", "extraction_state", "personas"):
+            await conn.execute(f"DELETE FROM {table} WHERE user_id LIKE 'test-%'")
     yield store
     await store.close()
 
