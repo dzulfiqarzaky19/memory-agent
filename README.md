@@ -38,7 +38,7 @@ When you `POST /search`, it uses **hybrid retrieval** by default:
 1. **Vector search** — cosine similarity on pgvector embeddings (semantic meaning)
 2. **Keyword search** — `pg_trgm` trigram similarity (exact term match)
 3. **RRF fusion** — Reciprocal Rank Fusion combines both rankings into one scored list
-4. **Scenario boost** — matched L2 scenarios inject their L1 memories at score 0.7
+4. **Scenario / instruction fill** — unmatched L2-linked and instruction memories fill remaining `top_k` slots after matched results
 
 You can switch to pure `vector` or `keyword` via `RECALL_STRATEGY` env var.
 
@@ -128,7 +128,7 @@ LLM_MODEL=google/gemma-4-e4b
 | `LLM_BASE_URL` | `http://127.0.0.1:1234/v1` | LLM API endpoint |
 | `LLM_API_KEY` | `not-needed` | LLM API key |
 | `LLM_MAX_TOKENS` | `4096` | Max tokens for LLM calls |
-| `EXTRACTION_EVERY_N_TURNS` | `5` | Extract every N conversation turns |
+| `EXTRACTION_EVERY_N_TURNS` | `5` | Extract every N user turns |
 | `EXTRACTION_MAX_MEMORIES` | `20` | Max memories per extraction |
 | `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |
 | `RECALL_RRF_K` | `60` | RRF fusion constant |

@@ -28,7 +28,7 @@ Atomic Fact (L1) ─── stored in `memories` table with pgvector embedding
 | Layer | Table | Purpose | Generated |
 |-------|-------|---------|-----------|
 | L0 | `conversations` | Raw dialogue turns | Every `POST /add` |
-| L1 | `memories` | Extracted atomic facts + embedding | Every N conversation turns (`EXTRACTION_EVERY_N_TURNS`) |
+| L1 | `memories` | Extracted atomic facts + embedding | Every N user turns (`EXTRACTION_EVERY_N_TURNS`) |
 | L2 | `scenarios` | Grouped related facts | Every 10 new L1 memories |
 | L3 | (computed) | User personality summary | On-demand via `GET /persona/{id}` |
 
@@ -55,8 +55,8 @@ Agent → POST /search(query)
   ├── 2. Vector cosine search (semantic)
   ├── 3. Keyword trigram search (exact match)
   ├── 4. RRF fusion of both rankings
-  ├── 5. Scenario boost: matched L2 → inject their L1 memories
-  ├── 6. Instruction injection: long-term rules always included
+  ├── 5. Scenario / instruction fill: unmatched L2-linked + instructions fill remaining top_k
+  ├── 6. (instructions ordered first among injects, then scenario-linked)
   └── 7. Return ranked results
 ```
 
@@ -143,7 +143,7 @@ services:
 
 | Variable | Default | What it controls |
 |----------|---------|-----------------|
-| `EXTRACTION_EVERY_N_TURNS` | `5` | Run LLM extraction every N conversation turns |
+| `EXTRACTION_EVERY_N_TURNS` | `5` | Run LLM extraction every N user turns |
 | `EXTRACTION_MAX_MEMORIES` | `20` | Max memories extracted per batch |
 | `PERSONA_EVERY_N_MEMORIES` | `50` | Regenerate persona every N new memories |
 | `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |

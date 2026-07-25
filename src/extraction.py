@@ -6,7 +6,14 @@ from typing import Optional
 
 import httpx
 
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MAX_TOKENS, LLM_MODEL, LLM_PROVIDER
+from config import (
+    EXTRACTION_MAX_MEMORIES,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MAX_TOKENS,
+    LLM_MODEL,
+    LLM_PROVIDER,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +121,8 @@ class LLMExtractor:
             memories = parsed.get("memories", [])
             if not isinstance(memories, list):
                 return []
-            return [atom for m in memories if (atom := _normalize_atom(m))]
+            atoms = [atom for m in memories if (atom := _normalize_atom(m))]
+            return atoms[:EXTRACTION_MAX_MEMORIES]
         except Exception as e:
             logger.error(f"Memory extraction failed: {e}")
             return []
@@ -128,9 +136,11 @@ class LLMExtractor:
 
         existing_block = ""
         if existing_scenarios:
-            existing_block = "\nEXISTING SCENARIOS (update these if new memories fit, or create new ones):\n"
+            existing_block = (
+                "\nEXISTING SCENARIOS (prefer reusing these names when memories still fit):\n"
+            )
             for s in existing_scenarios:
-                existing_block += f"  - {s['name']}: {s['description']} (IDs: {', '.join(s.get('memory_ids', []))})\n"
+                existing_block += f"  - {s['name']}: {s['description']}\n"
 
         prompt = f"""Group the following memories into contextual scenarios.
 A scenario is a named theme that groups related facts (e.g., "Project Taskflow", "Development Preferences", "Communication Style").
@@ -138,9 +148,10 @@ A scenario is a named theme that groups related facts (e.g., "Project Taskflow",
 Each scenario should:
 - Have a short, descriptive name (2-5 words)
 - Have a 1-2 sentence description of what this theme covers
-- Reference the memory numbers that belong to it
+- Reference membership ONLY via memory_indices into the MEMORIES list below (1-based numbers)
+- Do NOT emit memory UUIDs
 
-If existing scenarios are provided, prefer adding new memories to existing scenarios when they fit.
+If existing scenarios are provided, prefer reusing those names when memories still fit.
 
 MEMORIES:
 {memories_block}

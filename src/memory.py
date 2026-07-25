@@ -11,7 +11,7 @@ from config import (
     RECALL_SIMILARITY_THRESHOLD,
     RECALL_STRATEGY,
 )
-from embeddings import EmbeddingProvider, create_embedding_provider
+from embeddings import EmbeddingProvider
 from extraction import LLMExtractor
 from storage import Storage
 
@@ -48,28 +48,34 @@ class MemoryEngine:
                 metadata=metadata,
             )
 
-        conversations_seen = await self.storage.bump_conversation_counter(
-            user_id, len(messages)
-        )
-
+        user_turns = sum(1 for m in messages if m.get("role") == "user")
         memories_added = 0
         memory_ids = []
-        if conversations_seen >= EXTRACTION_EVERY_N_TURNS:
-            pending = await self.storage.get_recent_conversations(
-                user_id, limit=conversations_seen
-            )
-            extracted = await self._extract_and_store(user_id, pending, agent_id)
-            memories_added = len(extracted)
-            memory_ids = [m["id"] for m in extracted] if extracted else []
-            await self.storage.reset_conversation_counter(user_id)
 
-            if memories_added:
-                memories_since_scenario = await self.storage.bump_scenario_counter(
-                    user_id, memories_added
+        if user_turns:
+            state = await self.storage.bump_conversation_counter(user_id, user_turns)
+            conversations_seen = state["conversations_seen"]
+            last_extraction_at = state["last_extraction_at"]
+
+            if conversations_seen >= EXTRACTION_EVERY_N_TURNS:
+                cold_limit = max(EXTRACTION_EVERY_N_TURNS * 4, 40)
+                pending = await self.storage.get_conversations_since(
+                    user_id,
+                    since=last_extraction_at,
+                    limit=cold_limit if last_extraction_at is None else 200,
                 )
-                if memories_since_scenario >= SCENARIO_REBUILD_INTERVAL:
-                    await self._rebuild_scenarios(user_id)
-                    await self.storage.reset_scenario_counter(user_id)
+                extracted = await self._extract_and_store(user_id, pending, agent_id)
+                memories_added = len(extracted)
+                memory_ids = [m["id"] for m in extracted] if extracted else []
+                await self.storage.reset_conversation_counter(user_id)
+
+                if memories_added:
+                    memories_since_scenario = await self.storage.bump_scenario_counter(
+                        user_id, memories_added
+                    )
+                    if memories_since_scenario >= SCENARIO_REBUILD_INTERVAL:
+                        await self._rebuild_scenarios(user_id)
+                        await self.storage.reset_scenario_counter(user_id)
 
         return {
             "memories_added": memories_added,
@@ -80,10 +86,11 @@ class MemoryEngine:
         self,
         user_id: str,
         query: str,
-        top_k: int = 10,
+        top_k: int = RECALL_MAX_RESULTS,
         agent_id: Optional[str] = None,
     ) -> list[dict]:
         query_embedding = self.embedder.embed([query])[0]
+        threshold = RECALL_SIMILARITY_THRESHOLD
 
         if RECALL_STRATEGY == "hybrid":
             memory_results = await self.storage.hybrid_search_memories(
@@ -91,6 +98,7 @@ class MemoryEngine:
                 query=query,
                 query_embedding=query_embedding,
                 top_k=top_k,
+                vec_threshold=threshold,
                 rrf_k=RECALL_RRF_K,
                 agent_id=agent_id,
             )
@@ -106,6 +114,7 @@ class MemoryEngine:
                 user_id=user_id,
                 query_embedding=query_embedding,
                 top_k=top_k,
+                threshold=threshold,
                 agent_id=agent_id,
             )
 
@@ -113,14 +122,24 @@ class MemoryEngine:
         for r in memory_results:
             r["score"] = round(_priority_weight(r["score"], r.get("priority")), 4)
 
-        existing_ids = {r["id"] for r in memory_results}
+        memory_results.sort(key=lambda x: x["score"], reverse=True)
+        primary = memory_results[:top_k]
+        existing_ids = {r["id"] for r in primary}
+
+        # Option C: matched primary first; injects only fill remaining top_k slots.
+        injects: list[dict] = []
+
+        instructions = await self.storage.get_instructions(user_id, agent_id=agent_id, limit=5)
+        for ins in instructions:
+            if ins["id"] not in existing_ids:
+                injects.append(ins)
+                existing_ids.add(ins["id"])
 
         scenario_results = await self.storage.search_scenarios(
             user_id=user_id,
             query_embedding=query_embedding,
             top_k=3,
         )
-
         if scenario_results:
             unique_ids = []
             seen = set()
@@ -129,29 +148,30 @@ class MemoryEngine:
                     if mid not in seen:
                         seen.add(mid)
                         unique_ids.append(mid)
-
             if unique_ids:
                 scenario_memories = await self.storage.get_memories_by_ids(unique_ids[:20])
                 for sm in scenario_memories:
                     if sm["id"] not in existing_ids:
-                        sm["score"] = 0.7
                         sm["metadata"] = sm.get("metadata") or {}
                         sm["metadata"]["_from_scenario"] = True
-                        memory_results.append(sm)
+                        injects.append(sm)
                         existing_ids.add(sm["id"])
 
-        # Always surface long-term instructions (behavioral rules), regardless of match.
-        instructions = await self.storage.get_instructions(user_id, agent_id=agent_id, limit=5)
-        for ins in instructions:
-            if ins["id"] not in existing_ids:
-                ins["score"] = round(0.6 + (ins.get("priority") or 50) / 100.0 * 0.4, 4)
-                ins["metadata"] = ins.get("metadata") or {}
-                ins["metadata"]["_instruction"] = True
-                memory_results.append(ins)
-                existing_ids.add(ins["id"])
+        slots = top_k - len(primary)
+        if slots > 0 and injects:
+            floor = primary[-1]["score"] if primary else 0.0
+            filled = []
+            for i, item in enumerate(injects[:slots]):
+                item = dict(item)
+                item["score"] = round(floor - (i + 1) * 1e-4, 4)
+                meta = dict(item.get("metadata") or {})
+                if item.get("type") == "instruction" or meta.get("_instruction"):
+                    meta["_instruction"] = True
+                item["metadata"] = meta
+                filled.append(item)
+            return primary + filled
 
-        memory_results.sort(key=lambda x: x["score"], reverse=True)
-        return memory_results[:top_k]
+        return primary
 
     async def get_persona(self, user_id: str) -> dict:
         count = await self.storage.count_memories(user_id)
@@ -208,26 +228,28 @@ class MemoryEngine:
         if not grouped:
             return
 
-        await self.storage.delete_scenarios(user_id)
-
+        built = []
         for group in grouped:
             indices = group.get("memory_indices", [])
             linked_ids = [memory_ids[i] for i in indices if i < len(memory_ids)]
             if not linked_ids:
                 continue
-
             scenario_text = f"{group['name']}: {group['description']}"
             embedding = self.embedder.embed([scenario_text])[0]
-
-            await self.storage.save_scenario(
-                user_id=user_id,
-                name=group["name"],
-                description=group["description"],
-                embedding=embedding,
-                memory_ids=linked_ids,
+            built.append(
+                {
+                    "name": group["name"],
+                    "description": group["description"],
+                    "embedding": embedding,
+                    "memory_ids": linked_ids,
+                }
             )
 
-        logger.info(f"Rebuilt {len(grouped)} scenarios for {user_id}")
+        if not built:
+            return
+
+        await self.storage.replace_scenarios(user_id, built)
+        logger.info(f"Rebuilt {len(built)} scenarios for {user_id}")
 
     async def _extract_and_store(
         self,

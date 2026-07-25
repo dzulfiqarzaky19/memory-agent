@@ -9,4 +9,5 @@ build/
 venv/
 pgdata/
 .opencode.json/
+.opencode/state/
 .pytest_cache/

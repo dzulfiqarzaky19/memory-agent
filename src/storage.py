@@ -58,8 +58,17 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id);
-CREATE INDEX IF NOT EXISTS idx_mem_hash ON memories(user_id, text_hash);
 CREATE INDEX IF NOT EXISTS idx_mem_created ON memories(created_at);
+
+-- Dedupe then enforce unique (user_id, text_hash). Idempotent boot migration.
+DELETE FROM memories a
+ USING memories b
+ WHERE a.user_id = b.user_id
+   AND a.text_hash = b.text_hash
+   AND (a.created_at > b.created_at
+        OR (a.created_at = b.created_at AND a.id > b.id));
+DROP INDEX IF EXISTS idx_mem_hash;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_user_hash ON memories(user_id, text_hash);
 
 -- Full-text search column (generated) for keyword recall; trigram for fuzzy fallback.
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS text_tsv tsvector
@@ -99,6 +108,7 @@ CREATE TABLE IF NOT EXISTS extraction_state (
     memories_since_scenario INT NOT NULL DEFAULT 0,
     updated_at              TIMESTAMPTZ DEFAULT now()
 );
+ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extraction_at TIMESTAMPTZ;
 
 -- Cached L3 persona; regenerated every N new memories instead of every request.
 CREATE TABLE IF NOT EXISTS personas (
@@ -174,6 +184,46 @@ class Storage:
             for r in reversed(rows)
         ]
 
+    async def get_conversations_since(
+        self,
+        user_id: str,
+        since: Optional[datetime] = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        async with self._pool.acquire() as conn:
+            if since is None:
+                rows = await conn.fetch(
+                    """SELECT id, role, content, metadata, created_at
+                       FROM conversations
+                       WHERE user_id = $1
+                       ORDER BY created_at DESC
+                       LIMIT $2""",
+                    user_id,
+                    limit,
+                )
+                rows = list(reversed(rows))
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, role, content, metadata, created_at
+                       FROM conversations
+                       WHERE user_id = $1 AND created_at > $2
+                       ORDER BY created_at ASC
+                       LIMIT $3""",
+                    user_id,
+                    since,
+                    limit,
+                )
+        return [
+            {
+                "id": r["id"],
+                "role": r["role"],
+                "content": r["content"],
+                "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
     # -- Memories (L1) --
 
     async def save_memory(
@@ -192,22 +242,25 @@ class Storage:
         row_id = str(uuid4())
         meta = metadata or {}
         meta["text_hash"] = text_hash
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO memories
-                       (id, user_id, text, text_hash, embedding, mem_type, priority, agent_id, metadata)
-                   VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9)
-                   """,
-                row_id,
-                user_id,
-                text,
-                text_hash,
-                json.dumps(embedding),
-                mem_type,
-                priority,
-                agent_id,
-                json.dumps(meta),
-            )
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO memories
+                           (id, user_id, text, text_hash, embedding, mem_type, priority, agent_id, metadata)
+                       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9)
+                       """,
+                    row_id,
+                    user_id,
+                    text,
+                    text_hash,
+                    json.dumps(embedding),
+                    mem_type,
+                    priority,
+                    agent_id,
+                    json.dumps(meta),
+                )
+        except asyncpg.UniqueViolationError:
+            return None
         return row_id
 
     async def search_memories(
@@ -341,7 +394,11 @@ class Storage:
                 rrf_scores[rid] = [score, result]
 
         sorted_results = sorted(rrf_scores.values(), key=lambda x: x[0], reverse=True)
-        return [r[1] for r in sorted_results[:top_k]]
+        out = []
+        for fused, result in sorted_results[:top_k]:
+            result["score"] = round(fused, 4)
+            out.append(result)
+        return out
 
     async def count_memories(self, user_id: Optional[str] = None) -> int:
         async with self._pool.acquire() as conn:
@@ -516,25 +573,51 @@ class Storage:
         async with self._pool.acquire() as conn:
             await conn.execute("DELETE FROM scenarios WHERE user_id = $1", user_id)
 
+    async def replace_scenarios(self, user_id: str, scenarios: list[dict]) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM scenarios WHERE user_id = $1", user_id)
+                for s in scenarios:
+                    await conn.execute(
+                        """INSERT INTO scenarios
+                               (id, user_id, name, description, embedding, memory_ids, metadata)
+                           VALUES ($1, $2, $3, $4, $5::vector, $6, $7)""",
+                        str(uuid4()),
+                        user_id,
+                        s["name"],
+                        s["description"],
+                        json.dumps(s["embedding"]),
+                        json.dumps(s["memory_ids"]),
+                        json.dumps(s.get("metadata") or {}),
+                    )
+
     # -- Extraction cadence (persistent counters) --
 
-    async def bump_conversation_counter(self, user_id: str, n: int) -> int:
+    async def bump_conversation_counter(self, user_id: str, n: int) -> dict:
         async with self._pool.acquire() as conn:
-            return await conn.fetchval(
+            row = await conn.fetchrow(
                 """INSERT INTO extraction_state (user_id, conversations_seen)
                    VALUES ($1, $2)
                    ON CONFLICT (user_id) DO UPDATE
                      SET conversations_seen = extraction_state.conversations_seen + $2,
                          updated_at = now()
-                   RETURNING conversations_seen""",
+                   RETURNING conversations_seen, last_extraction_at""",
                 user_id,
                 n,
             )
+        return {
+            "conversations_seen": row["conversations_seen"],
+            "last_extraction_at": row["last_extraction_at"],
+        }
 
     async def reset_conversation_counter(self, user_id: str) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "UPDATE extraction_state SET conversations_seen = 0 WHERE user_id = $1",
+                """UPDATE extraction_state
+                   SET conversations_seen = 0,
+                       last_extraction_at = now(),
+                       updated_at = now()
+                   WHERE user_id = $1""",
                 user_id,
             )
 

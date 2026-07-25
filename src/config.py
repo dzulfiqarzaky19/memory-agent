@@ -34,5 +34,6 @@ PERSONA_EVERY_N_MEMORIES = int(os.getenv("PERSONA_EVERY_N_MEMORIES", "50"))
 RECALL_STRATEGY = os.getenv("RECALL_STRATEGY", "hybrid")
 RECALL_MAX_RESULTS = int(os.getenv("RECALL_MAX_RESULTS", "10"))
 RECALL_SIMILARITY_THRESHOLD = float(os.getenv("RECALL_SIMILARITY_THRESHOLD", "0.3"))
+# Unused with RRF (rank-based fusion); kept for env compat only.
 RECALL_KEYWORD_WEIGHT = float(os.getenv("RECALL_KEYWORD_WEIGHT", "0.3"))
 RECALL_RRF_K = int(os.getenv("RECALL_RRF_K", "60"))

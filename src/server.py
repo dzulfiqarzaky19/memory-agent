@@ -6,7 +6,6 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 
-from config import RECALL_MAX_RESULTS, RECALL_SIMILARITY_THRESHOLD
 from embeddings import create_embedding_provider
 from extraction import LLMExtractor
 from memory import MemoryEngine

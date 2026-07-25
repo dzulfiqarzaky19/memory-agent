@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 
@@ -35,6 +37,27 @@ async def test_dedup_memories(db):
 
 
 @pytest.mark.asyncio
+async def test_unique_user_text_hash(db):
+    uid = "test-unique-hash"
+    emb = [0.1] * 768
+    text = "Unique constraint fact"
+
+    mid1 = await db.save_memory(uid, text, emb)
+    assert mid1 is not None
+    # Second insert must be rejected (fast-path or UniqueViolation).
+    mid2 = await db.save_memory(uid, text, emb)
+    assert mid2 is None
+    assert await db.count_memories(uid) == 1
+
+    async with db._pool.acquire() as conn:
+        idx = await conn.fetchval(
+            """SELECT indexname FROM pg_indexes
+               WHERE tablename = 'memories' AND indexname = 'idx_mem_user_hash'"""
+        )
+    assert idx == "idx_mem_user_hash"
+
+
+@pytest.mark.asyncio
 async def test_conversation_crud(db):
     uid = "test-conv-storage"
 
@@ -44,6 +67,33 @@ async def test_conversation_crud(db):
     convs = await db.get_recent_conversations(uid, limit=10)
     assert len(convs) == 1
     assert convs[0]["content"] == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_conversations_since(db):
+    uid = "test-conv-since"
+
+    await db.save_conversation(uid, "user", "old message")
+    # Stamp extraction boundary after the old message.
+    await db.bump_conversation_counter(uid, 1)
+    await db.reset_conversation_counter(uid)
+
+    state = await db.bump_conversation_counter(uid, 0)
+    # bump 0 still returns state; if conversations_seen was 0, stays 0
+    since = state["last_extraction_at"]
+    assert since is not None
+
+    await db.save_conversation(uid, "user", "new message")
+    await db.save_conversation(uid, "assistant", "new reply")
+
+    pending = await db.get_conversations_since(uid, since=since)
+    texts = [c["content"] for c in pending]
+    assert "old message" not in texts
+    assert "new message" in texts
+    assert "new reply" in texts
+
+    cold = await db.get_conversations_since(uid, since=None, limit=10)
+    assert any(c["content"] == "old message" for c in cold)
 
 
 @pytest.mark.asyncio
@@ -81,6 +131,39 @@ async def test_hybrid_search(db):
 
 
 @pytest.mark.asyncio
+async def test_hybrid_rrf_score_is_fused(db):
+    uid = "test-rrf-fused"
+    emb = [0.1] * 768
+    rrf_k = 60
+
+    # Identical embeddings → both share vector ranks; keyword differentiates.
+    await db.save_memory(uid, "alpha keyword only here", emb)
+    await db.save_memory(uid, "beta something else entirely", emb)
+
+    results = await db.hybrid_search_memories(
+        uid,
+        query="alpha keyword",
+        query_embedding=emb,
+        top_k=5,
+        vec_threshold=0.0,
+        kw_threshold=0.0,
+        rrf_k=rrf_k,
+    )
+    assert results
+    # Item in both lists has score > single-list contribution 1/(k+rank+1) max single ≈ 1/61
+    alpha = next(r for r in results if "alpha" in r["text"])
+    assert alpha["score"] == round(alpha["score"], 4)
+    # Fused score must include keyword contribution when present
+    meta = alpha.get("metadata") or {}
+    if "_kw_score" in meta and "_vec_score" in meta:
+        # Both lists hit: fused > either single rank term alone for rank0+rank0
+        assert alpha["score"] >= round(1.0 / (rrf_k + 1), 4)
+        assert alpha["score"] > round(1.0 / (rrf_k + 1), 4) or alpha["score"] == round(
+            2.0 / (rrf_k + 1), 4
+        )
+
+
+@pytest.mark.asyncio
 async def test_scenario_crud(db):
     uid = "test-scenario"
     emb = [0.1] * 768
@@ -94,6 +177,31 @@ async def test_scenario_crud(db):
 
     searched = await db.search_scenarios(uid, emb, top_k=5, threshold=0.0)
     assert len(searched) == 1
+
+
+@pytest.mark.asyncio
+async def test_replace_scenarios_atomic(db):
+    uid = "test-replace-scen"
+    emb = [0.1] * 768
+
+    await db.save_scenario(uid, "Old A", "desc a", emb, ["m1"])
+    await db.save_scenario(uid, "Old B", "desc b", emb, ["m2"])
+    assert await db.count_scenarios(uid) == 2
+
+    await db.replace_scenarios(
+        uid,
+        [
+            {
+                "name": "New Only",
+                "description": "replaced set",
+                "embedding": emb,
+                "memory_ids": ["m3"],
+            }
+        ],
+    )
+    scenarios = await db.get_all_scenarios(uid)
+    assert len(scenarios) == 1
+    assert scenarios[0]["name"] == "New Only"
 
 
 @pytest.mark.asyncio

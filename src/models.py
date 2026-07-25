@@ -4,6 +4,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from config import RECALL_MAX_RESULTS
+
 
 class Role(str, Enum):
     user = "user"
@@ -32,7 +34,7 @@ class AddResponse(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     user_id: str = Field(..., min_length=1)
-    top_k: int = Field(default=10, ge=1, le=100)
+    top_k: int = Field(default=RECALL_MAX_RESULTS, ge=1, le=100)
     agent_id: Optional[str] = None
 
 

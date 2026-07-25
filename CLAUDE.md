@@ -81,7 +81,7 @@ When you `POST /search`, uses **hybrid retrieval** by default:
 1. **Vector search** — cosine similarity on pgvector embeddings (semantic)
 2. **Keyword search** — `pg_trgm` trigram similarity (exact term match)
 3. **RRF fusion** — Reciprocal Rank Fusion combines both rankings
-4. **Scenario boost** — matched L2 scenarios inject their L1 memories at score 0.7
+4. **Scenario / instruction fill** — unmatched L2-linked and instruction memories fill remaining `top_k` slots after matched results
 
 Switch via `RECALL_STRATEGY` env var: `hybrid`, `vector`, or `keyword`.
 
@@ -136,7 +136,7 @@ All settings in `.env` (single source of truth). Copy `.env` and edit for your s
 | `LLM_PROVIDER` | `openai` | LLM provider for extraction |
 | `LLM_MODEL` | `google/gemma-4-e4b` | LLM for extraction |
 | `LLM_BASE_URL` | `http://127.0.0.1:1234/v1` | LLM API endpoint |
-| `EXTRACTION_EVERY_N_TURNS` | `5` | Extract every N conversation turns |
+| `EXTRACTION_EVERY_N_TURNS` | `5` | Extract every N user turns |
 | `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |
 | `RECALL_RRF_K` | `60` | RRF fusion constant |
 | `RECALL_SIMILARITY_THRESHOLD` | `0.3` | Vector similarity minimum |
