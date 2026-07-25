@@ -3,27 +3,65 @@
 Run: python memory_mcp.py
 Connect via opencode.json as stdio MCP server.
 """
-from mcp.server import FastMCP
+import os
+
 import httpx
+from mcp.server import FastMCP
 
 MCP = FastMCP("memory-agent")
-API_BASE = "http://localhost:8000"
+API_BASE = (os.getenv("MEMORY_AGENT_URL") or "http://127.0.0.1:8000").rstrip("/")
+_API_SECRET = (os.getenv("MEMORY_API_SECRET") or "").strip()
+
+
+def _headers() -> dict[str, str]:
+    if not _API_SECRET:
+        return {}
+    return {"X-Memory-Key": _API_SECRET}
+
+
+def _canon_user(user_id: str) -> str:
+    uid = (user_id or "").strip().lower()
+    if not uid:
+        raise ValueError("user_id must be non-empty")
+    return uid
+
+
+def _trust_banner(trust: dict | None) -> str:
+    if not trust:
+        return ""
+    ok = trust.get("last_extract_ok")
+    ok_s = "true" if ok is True else ("false" if ok is False else "unknown")
+    return (
+        f"[trust user={trust.get('user_id')} l0={trust.get('l0_count')} l1={trust.get('l1_count')} "
+        f"extract_ok={ok_s} pending={trust.get('conversations_seen')} "
+        f"recall_trusted={trust.get('recall_trusted')}]"
+    )
 
 
 @MCP.tool()
 async def search_memories(user_id: str, query: str) -> str:
     """Recall relevant memories before responding to the user."""
+    uid = _canon_user(user_id)
     async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.post(f"{API_BASE}/search", json={"user_id": user_id, "query": query, "top_k": 5})
+        r = await c.post(
+            f"{API_BASE}/search",
+            json={"user_id": uid, "query": query, "top_k": 5},
+            headers=_headers(),
+        )
         r.raise_for_status()
         data = r.json()
+    banner = _trust_banner(data.get("trust"))
     if not data["results"]:
-        return "No relevant memories found."
+        note = "No relevant memories found."
+        if data.get("trust") and not data["trust"].get("recall_trusted"):
+            note += " (recall untrusted — extraction lag or prior extract failure)"
+        return f"{banner}\n{note}".strip()
     lines = [
         f"- [{m['score']:.4f}] ({m.get('type') or 'memory'}) {m['text']}"
         for m in data["results"]
     ]
-    return "Relevant memories:\n" + "\n".join(lines)
+    body = "Relevant memories:\n" + "\n".join(lines)
+    return f"{banner}\n{body}".strip()
 
 
 @MCP.tool()
@@ -32,6 +70,7 @@ async def store_memories(user_id: str, messages: str) -> str:
 
     Pass messages as alternating 'user: ...' and 'assistant: ...' lines.
     """
+    uid = _canon_user(user_id)
     lines = [l.strip() for l in messages.strip().split("\n") if l.strip()]
     parsed = []
     for line in lines:
@@ -43,32 +82,44 @@ async def store_memories(user_id: str, messages: str) -> str:
         return "No valid messages found. Format: user: ... / assistant: ..."
 
     async with httpx.AsyncClient(timeout=120) as c:
-        r = await c.post(f"{API_BASE}/add", json={"user_id": user_id, "messages": parsed})
+        r = await c.post(
+            f"{API_BASE}/add",
+            json={"user_id": uid, "messages": parsed},
+            headers=_headers(),
+        )
         r.raise_for_status()
         data = r.json()
-    return f"Stored {len(parsed)} messages. Memories extracted: {data['memories_added']}."
+    return (
+        f"Stored {len(parsed)} messages for {data.get('user_id', uid)}. "
+        f"Memories extracted: {data['memories_added']} "
+        f"(extract_status={data.get('extract_status', '?')})."
+    )
 
 
 @MCP.tool()
 async def get_persona(user_id: str) -> str:
     """Get the user's persona summary."""
+    uid = _canon_user(user_id)
     async with httpx.AsyncClient(timeout=120) as c:
-        r = await c.get(f"{API_BASE}/persona/{user_id}")
+        r = await c.get(f"{API_BASE}/persona/{uid}", headers=_headers())
         r.raise_for_status()
         data = r.json()
+    banner = _trust_banner(data.get("trust"))
     if data["memory_count"] == 0:
-        return "No memories stored yet."
-    return f"[{data['memory_count']} memories] {data['summary']}"
+        return f"{banner}\nNo memories stored yet.".strip()
+    return f"{banner}\n[{data['memory_count']} memories] {data['summary']}".strip()
 
 
 @MCP.tool()
 async def reload_config(model: str, base_url: str = "") -> str:
-    """Hot-swap the LLM model/config without restarting the server."""
+    """Hot-swap the LLM model/config (server must set MEMORY_ALLOW_RELOAD=1)."""
     body = {"model": model}
     if base_url:
         body["base_url"] = base_url
     async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.post(f"{API_BASE}/reload", json=body)
+        r = await c.post(f"{API_BASE}/reload", json=body, headers=_headers())
+        if r.status_code == 404:
+            return "Reload disabled on server (MEMORY_ALLOW_RELOAD not set)."
         r.raise_for_status()
         data = r.json()
     return f"Switched to model={data['model']} at {data['base_url']}"

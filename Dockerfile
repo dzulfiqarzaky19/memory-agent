@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements-base.txt
 
 COPY src/ src/
 COPY memory_mcp.py .
-COPY .env .
+# .env is NOT baked in — compose env_file mounts host .env at runtime.
 
 ENV PYTHONPATH=/app/src
 

@@ -15,16 +15,25 @@ DATABASE_URL = os.getenv(
 )
 
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-nomic-embed-text-v1.5@q8_0")
-EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "768"))
+# Defaults match the compose TEI sidecar (MiniLM 384-d). Override via env if needed.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "384"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "not-needed")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", OPENAI_BASE_URL)
+EMBEDDING_BASE_URL = (os.getenv("EMBEDDING_BASE_URL") or OPENAI_BASE_URL).rstrip("/")
+# OpenAI text-embedding-3-* accepts dimensions=; TEI/MiniLM reject it.
+EMBEDDING_SEND_DIMENSIONS = os.getenv("EMBEDDING_SEND_DIMENSIONS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
-LLM_MODEL = os.getenv("LLM_MODEL", "google/gemma-4-e4b")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:1234/v1")
-LLM_API_KEY = os.getenv("LLM_API_KEY", OPENAI_API_KEY)
+# LLM chat — read only these from the environment (.env via compose env_file).
+# No rewriting, no provider maps, no fallback to embedding/OpenAI base.
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").strip()
+LLM_MODEL = (os.getenv("LLM_MODEL") or "").strip()
+LLM_API_KEY = (os.getenv("LLM_API_KEY") or "").strip()
+LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or "").strip().rstrip("/")
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
 EXTRACTION_EVERY_N_TURNS = int(os.getenv("EXTRACTION_EVERY_N_TURNS", "5"))
@@ -37,3 +46,14 @@ RECALL_SIMILARITY_THRESHOLD = float(os.getenv("RECALL_SIMILARITY_THRESHOLD", "0.
 # Unused with RRF (rank-based fusion); kept for env compat only.
 RECALL_KEYWORD_WEIGHT = float(os.getenv("RECALL_KEYWORD_WEIGHT", "0.3"))
 RECALL_RRF_K = int(os.getenv("RECALL_RRF_K", "60"))
+
+# Door: shared secret for HTTP (header X-Memory-Key). Empty = auth off (local tests).
+MEMORY_API_SECRET = (os.getenv("MEMORY_API_SECRET") or "").strip()
+# Hot-reload LLM config is off unless explicitly enabled.
+MEMORY_ALLOW_RELOAD = os.getenv("MEMORY_ALLOW_RELOAD", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Host bind for bare uvicorn (__main__). Compose publishes 127.0.0.1; in-container stays 0.0.0.0.
+MEMORY_BIND_HOST = (os.getenv("MEMORY_BIND_HOST") or "127.0.0.1").strip() or "127.0.0.1"

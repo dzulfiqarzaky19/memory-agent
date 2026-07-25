@@ -10,8 +10,8 @@ from config import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
+    EMBEDDING_SEND_DIMENSIONS,
     OPENAI_API_KEY,
-    OPENAI_BASE_URL,
 )
 
 
@@ -27,11 +27,19 @@ class EmbeddingProvider(abc.ABC):
 
 
 class OpenAICompatibleEmbedding(EmbeddingProvider):
-    def __init__(self, model: str, api_key: str, base_url: str, dims: int):
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str,
+        dims: int,
+        send_dimensions: bool = False,
+    ):
         self._model = model
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._dims = dims
+        self._send_dimensions = send_dimensions
 
     @property
     def dimensions(self) -> int:
@@ -40,11 +48,14 @@ class OpenAICompatibleEmbedding(EmbeddingProvider):
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        with httpx.Client(timeout=30) as client:
+        payload: dict = {"input": texts, "model": self._model}
+        if self._send_dimensions:
+            payload["dimensions"] = self._dims
+        with httpx.Client(timeout=60) as client:
             resp = client.post(
                 f"{self._base_url}/embeddings",
                 headers={"Authorization": f"Bearer {self._api_key}"},
-                json={"input": texts, "model": self._model, "dimensions": self._dims},
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()["data"]
@@ -86,9 +97,10 @@ def create_embedding_provider(
     if provider == "openai":
         return OpenAICompatibleEmbedding(
             model=model,
-            api_key=OPENAI_API_KEY,
+            api_key=OPENAI_API_KEY or "not-needed",
             base_url=EMBEDDING_BASE_URL,
             dims=dims,
+            send_dimensions=EMBEDDING_SEND_DIMENSIONS,
         )
     elif provider == "local":
         return LocalONNXEmbedding(model_name=model, dims=dims)

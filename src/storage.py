@@ -109,6 +109,10 @@ CREATE TABLE IF NOT EXISTS extraction_state (
     updated_at              TIMESTAMPTZ DEFAULT now()
 );
 ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extraction_at TIMESTAMPTZ;
+ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extract_ok BOOLEAN;
+ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extract_error TEXT;
+ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extract_attempt_at TIMESTAMPTZ;
+
 
 -- Cached L3 persona; regenerated every N new memories instead of every request.
 CREATE TABLE IF NOT EXISTS personas (
@@ -118,6 +122,16 @@ CREATE TABLE IF NOT EXISTS personas (
     memories_at_generation INT NOT NULL,
     generated_at           TIMESTAMPTZ DEFAULT now()
 );
+
+-- Auto-capture session cursors (Tencent-style). last_batch_hash dedupes exact retries.
+CREATE TABLE IF NOT EXISTS capture_checkpoints (
+    session_key     TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    messages_seen   INT NOT NULL DEFAULT 0,
+    last_batch_hash TEXT,
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_capture_user ON capture_checkpoints(user_id);
 """
 
 
@@ -128,9 +142,59 @@ class Storage:
 
     async def initialize(self):
         self._pool = await asyncpg.create_pool(self._dsn, min_size=2, max_size=10)
+        dims = EMBEDDING_DIMENSIONS
         async with self._pool.acquire() as conn:
-            await conn.execute(SCHEMA_SQL.replace("{dims}", str(EMBEDDING_DIMENSIONS)))
-        logger.info("Storage initialized (pgvector schema ready)")
+            await conn.execute(SCHEMA_SQL.replace("{dims}", str(dims)))
+            await self._ensure_embedding_dimensions(conn, dims)
+        logger.info("Storage initialized (pgvector schema ready, dims=%s)", dims)
+
+    async def _ensure_embedding_dimensions(self, conn, dims: int) -> None:
+        """If vector columns were created at a different width, rebuild them (data wipe)."""
+        for table in ("memories", "scenarios"):
+            row = await conn.fetchrow(
+                """
+                SELECT atttypmod AS dims
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND c.relname = $1
+                  AND a.attname = 'embedding'
+                  AND NOT a.attisdropped
+                """,
+                table,
+            )
+            if row is None:
+                continue
+            # pgvector stores typmod as dimensions
+            current = int(row["dims"]) if row["dims"] is not None else None
+            if current == dims:
+                continue
+            logger.warning(
+                "Rebuilding %s.embedding: %s-d -> %s-d (vector rows cleared)",
+                table,
+                current,
+                dims,
+            )
+            await conn.execute(f"DROP INDEX IF EXISTS idx_mem_embedding")
+            await conn.execute(f"DROP INDEX IF EXISTS idx_scen_embedding")
+            await conn.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS embedding")
+            await conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN embedding vector({dims})"
+            )
+        # Recreate HNSW indexes if missing after rebuild
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mem_embedding ON memories
+                USING hnsw (embedding vector_cosine_ops)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_scen_embedding ON scenarios
+                USING hnsw (embedding vector_cosine_ops)
+            """
+        )
 
     async def close(self):
         if self._pool:
@@ -183,6 +247,46 @@ class Storage:
             }
             for r in reversed(rows)
         ]
+
+    async def get_capture_checkpoint(self, session_key: str) -> Optional[dict]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT session_key, user_id, messages_seen, last_batch_hash, updated_at
+                   FROM capture_checkpoints WHERE session_key = $1""",
+                session_key,
+            )
+        if row is None:
+            return None
+        return {
+            "session_key": row["session_key"],
+            "user_id": row["user_id"],
+            "messages_seen": row["messages_seen"],
+            "last_batch_hash": row["last_batch_hash"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def upsert_capture_checkpoint(
+        self,
+        session_key: str,
+        user_id: str,
+        messages_seen: int,
+        last_batch_hash: Optional[str],
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO capture_checkpoints
+                       (session_key, user_id, messages_seen, last_batch_hash, updated_at)
+                   VALUES ($1, $2, $3, $4, now())
+                   ON CONFLICT (session_key) DO UPDATE SET
+                       user_id = EXCLUDED.user_id,
+                       messages_seen = EXCLUDED.messages_seen,
+                       last_batch_hash = EXCLUDED.last_batch_hash,
+                       updated_at = now()""",
+                session_key,
+                user_id,
+                messages_seen,
+                last_batch_hash,
+            )
 
     async def get_conversations_since(
         self,
@@ -574,6 +678,7 @@ class Storage:
             await conn.execute("DELETE FROM scenarios WHERE user_id = $1", user_id)
 
     async def replace_scenarios(self, user_id: str, scenarios: list[dict]) -> None:
+        """Legacy full wipe — prefer upsert_scenarios_by_name."""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM scenarios WHERE user_id = $1", user_id)
@@ -591,6 +696,62 @@ class Storage:
                         json.dumps(s.get("metadata") or {}),
                     )
 
+    async def upsert_scenarios_by_name(self, user_id: str, scenarios: list[dict]) -> int:
+        """Merge scenarios by case-insensitive name. Never deletes siblings."""
+        if not scenarios:
+            return 0
+        touched = 0
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                for s in scenarios:
+                    name = (s.get("name") or "").strip()
+                    if not name:
+                        continue
+                    existing = await conn.fetchrow(
+                        """SELECT id, memory_ids FROM scenarios
+                           WHERE user_id = $1 AND lower(name) = lower($2)
+                           LIMIT 1""",
+                        user_id,
+                        name,
+                    )
+                    new_ids = list(s.get("memory_ids") or [])
+                    if existing:
+                        old_ids = existing["memory_ids"]
+                        if isinstance(old_ids, str):
+                            old_ids = json.loads(old_ids)
+                        merged = list(dict.fromkeys(list(old_ids or []) + new_ids))
+                        await conn.execute(
+                            """UPDATE scenarios
+                               SET name = $2,
+                                   description = $3,
+                                   embedding = $4::vector,
+                                   memory_ids = $5,
+                                   metadata = $6,
+                                   updated_at = now()
+                               WHERE id = $1""",
+                            existing["id"],
+                            name,
+                            s["description"],
+                            json.dumps(s["embedding"]),
+                            json.dumps(merged),
+                            json.dumps(s.get("metadata") or {}),
+                        )
+                    else:
+                        await conn.execute(
+                            """INSERT INTO scenarios
+                                   (id, user_id, name, description, embedding, memory_ids, metadata)
+                               VALUES ($1, $2, $3, $4, $5::vector, $6, $7)""",
+                            str(uuid4()),
+                            user_id,
+                            name,
+                            s["description"],
+                            json.dumps(s["embedding"]),
+                            json.dumps(new_ids),
+                            json.dumps(s.get("metadata") or {}),
+                        )
+                    touched += 1
+        return touched
+
     # -- Extraction cadence (persistent counters) --
 
     async def bump_conversation_counter(self, user_id: str, n: int) -> dict:
@@ -601,25 +762,80 @@ class Storage:
                    ON CONFLICT (user_id) DO UPDATE
                      SET conversations_seen = extraction_state.conversations_seen + $2,
                          updated_at = now()
-                   RETURNING conversations_seen, last_extraction_at""",
+                   RETURNING conversations_seen, last_extraction_at,
+                             last_extract_ok, last_extract_error, last_extract_attempt_at""",
                 user_id,
                 n,
             )
         return {
             "conversations_seen": row["conversations_seen"],
             "last_extraction_at": row["last_extraction_at"],
+            "last_extract_ok": row["last_extract_ok"],
+            "last_extract_error": row["last_extract_error"],
+            "last_extract_attempt_at": row["last_extract_attempt_at"],
         }
 
-    async def reset_conversation_counter(self, user_id: str) -> None:
+    async def get_extraction_state(self, user_id: str) -> Optional[dict]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT conversations_seen, last_extraction_at, last_extract_ok,
+                          last_extract_error, last_extract_attempt_at, memories_since_scenario
+                   FROM extraction_state WHERE user_id = $1""",
+                user_id,
+            )
+        if not row:
+            return None
+        return {
+            "conversations_seen": row["conversations_seen"],
+            "last_extraction_at": row["last_extraction_at"],
+            "last_extract_ok": row["last_extract_ok"],
+            "last_extract_error": row["last_extract_error"],
+            "last_extract_attempt_at": row["last_extract_attempt_at"],
+            "memories_since_scenario": row["memories_since_scenario"],
+        }
+
+    async def count_conversations(self, user_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM conversations WHERE user_id = $1", user_id
+            )
+
+    async def mark_extraction_success(self, user_id: str) -> None:
+        """Cadence complete: clear counter and advance extraction watermark."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO extraction_state
+                       (user_id, conversations_seen, last_extraction_at,
+                        last_extract_ok, last_extract_error, last_extract_attempt_at, updated_at)
+                   VALUES ($1, 0, now(), true, NULL, now(), now())
+                   ON CONFLICT (user_id) DO UPDATE SET
+                       conversations_seen = 0,
+                       last_extraction_at = now(),
+                       last_extract_ok = true,
+                       last_extract_error = NULL,
+                       last_extract_attempt_at = now(),
+                       updated_at = now()""",
+                user_id,
+            )
+
+    async def mark_extraction_failure(self, user_id: str, error: str) -> None:
+        """Do NOT reset conversations_seen — window must retry next turn."""
+        err = (error or "unknown")[:500]
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """UPDATE extraction_state
-                   SET conversations_seen = 0,
-                       last_extraction_at = now(),
+                   SET last_extract_ok = false,
+                       last_extract_error = $2,
+                       last_extract_attempt_at = now(),
                        updated_at = now()
                    WHERE user_id = $1""",
                 user_id,
+                err,
             )
+
+    async def reset_conversation_counter(self, user_id: str) -> None:
+        """Deprecated alias — success path only."""
+        await self.mark_extraction_success(user_id)
 
     async def bump_scenario_counter(self, user_id: str, n: int) -> int:
         async with self._pool.acquire() as conn:

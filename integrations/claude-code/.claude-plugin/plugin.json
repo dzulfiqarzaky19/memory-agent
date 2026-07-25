@@ -1,0 +1,9 @@
+{
+  "name": "memory-agent",
+  "version": "0.1.0",
+  "description": "Auto-capture Claude Code turns into local memory-agent (L0) and expose search/persona via MCP.",
+  "author": {
+    "name": "memory-agent"
+  },
+  "keywords": ["memory", "auto-capture", "mcp"]
+}

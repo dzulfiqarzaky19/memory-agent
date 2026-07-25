@@ -1,13 +1,21 @@
 # Memory enforcement
 
-**Rule:** After every response you send to the user in this repo, you **MUST** call `store_memories` with `user_id=zaky` and the full exchange formatted as:
+**Preferred path:** Claude Code plugin auto-capture (Stop → `POST /capture`).
+When that plugin is installed and the sidecar is up, L0 is written by the host —
+do not double-write via MCP on every turn.
+
+**user_id:** always lowercase canonical form (`zaky`, not `Zaky`). Server
+normalizes; still pass lowercase from tools/hooks.
+
+**Fallback** (plugin missing / non-Claude host / sidecar capture failing): after
+every response, call `store_memories` with `user_id=zaky` and:
 ```
 user: <their message>
 assistant: <your response>
 ```
 
-This is not optional. No response is complete without it. If your response was generated across multiple tool calls, store it after the final tool output lands.
+**Always** use MCP for recall: `get_persona` at session start, `search_memories`
+before answering when prior context may matter. Read the trust banner —
+`recall_trusted=false` means empty ≠ “user has no prefs.”
 
-Skip only if the user explicitly says "don't save this" or the exchange is purely a tool acknowledgement with no conversational content.
-
-Consequence of violation: the conversation history is lost for future sessions. Treat this as a correctness bug.
+Skip store only if the user says "don't save this" or the exchange is pure tool noise.

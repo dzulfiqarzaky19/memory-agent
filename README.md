@@ -26,10 +26,13 @@ You / Agent  ──POST /search──▶  memory-agent  ──▶  return releva
 
 | Layer | What | Where | When |
 |-------|------|-------|------|
-| L0 | Raw conversation turns | `conversations` table | Every `POST /add` |
+| L0 | Raw conversation turns | `conversations` table | Every `POST /add` or `POST /capture` |
 | L1 | Extracted atomic facts (e.g. "User prefers dark mode") | `memories` table with pgvector index | Every N turns (default 5) |
 | L2 | Grouped scenarios (e.g. "Development Preferences") | `scenarios` table | Every 10 new L1 memories |
 | L3 | User persona summary | Computed on demand from L1 | `GET /persona/{id}` |
+
+`POST /capture` is the auto-capture path: same L0/L1 pipeline as `/add`, plus a
+per-`session_key` checkpoint that dedupes exact batch retries.
 
 ### Recall strategy (L1)
 
@@ -51,9 +54,31 @@ You can switch to pure `vector` or `keyword` via `RECALL_STRATEGY` env var.
 docker compose up -d
 ```
 
-This starts `db` (pgvector on port 5433) and `app` (memory-agent on port 8000).
-The app container automatically connects to the database and your local LM Studio
-via `host.docker.internal:1234`.
+This starts `db` (pgvector on port 5433), `embeddings` (TEI MiniLM 384-d, free/local),
+and `app` (memory-agent on port 8000). Chat LLM comes from your `.env`
+(`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`). Embeddings do **not** need LM Studio.
+
+### Claude Code (auto-capture every turn)
+
+Host-driven capture (Tencent-style), not “hope the model calls MCP”:
+
+```powershell
+# Windows — sidecar + Claude plugin
+.\scripts\setup.ps1 -Claude
+
+# plugin only (sidecar already running)
+.\scripts\setup.ps1 -ClaudeOnly
+```
+
+```bash
+# macOS / Linux
+./scripts/setup.sh --claude
+./scripts/setup.sh --claude-only
+```
+
+After install, open a **new** Claude Code session. Each Stop posts the latest
+user+assistant exchange to `POST /capture` (L0). MCP tools stay available for
+search/persona. Details: [integrations/claude-code/README.md](integrations/claude-code/README.md).
 
 ### Without Docker (local dev)
 
@@ -133,28 +158,35 @@ LLM_MODEL=google/gemma-4-e4b
 | `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |
 | `RECALL_RRF_K` | `60` | RRF fusion constant |
 | `RECALL_SIMILARITY_THRESHOLD` | `0.3` | Vector similarity minimum |
+| `MEMORY_API_SECRET` | _(empty)_ | If set, all routes except `/health` require header `X-Memory-Key` |
+| `MEMORY_ALLOW_RELOAD` | `false` | Must be `true` to enable `POST /reload` |
+| `MEMORY_BIND_HOST` | `127.0.0.1` | Bare-uvicorn bind; compose keeps in-container `0.0.0.0` and publishes `127.0.0.1:8000` |
+
+Compose publishes **localhost only** (`127.0.0.1:8000`, `127.0.0.1:5433`). Set `MEMORY_API_SECRET` in `.env` (setup scripts generate one). MCP/hook send `X-Memory-Key`.
 
 ## API
 
 ```bash
+# Health (open)
+curl -s http://127.0.0.1:8000/health
+
 # Store conversation
-curl -X POST http://localhost:8000/add \
+curl -X POST http://127.0.0.1:8000/add \
   -H "Content-Type: application/json" \
+  -H "X-Memory-Key: $MEMORY_API_SECRET" \
   -d '{"user_id": "zaky", "messages": [{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}'
 
 # Search memories
-curl -X POST http://localhost:8000/search \
+curl -X POST http://127.0.0.1:8000/search \
   -H "Content-Type: application/json" \
+  -H "X-Memory-Key: $MEMORY_API_SECRET" \
   -d '{"user_id": "zaky", "query": "what tech stack?"}'
 
 # Get persona
-curl http://localhost:8000/persona/zaky
+curl -H "X-Memory-Key: $MEMORY_API_SECRET" http://127.0.0.1:8000/persona/zaky
 
 # List scenarios
-curl http://localhost:8000/scenarios/zaky
-
-# Health check
-curl http://localhost:8000/health
+curl -H "X-Memory-Key: $MEMORY_API_SECRET" http://127.0.0.1:8000/scenarios/zaky
 ```
 
 ### Response notes

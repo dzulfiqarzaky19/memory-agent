@@ -29,6 +29,26 @@ class AddRequest(BaseModel):
 class AddResponse(BaseModel):
     memories_added: int
     memory_ids: list[str]
+    extract_status: str = "skipped"
+    user_id: Optional[str] = None
+
+
+class CaptureRequest(BaseModel):
+    messages: list[Message]
+    user_id: str = Field(..., min_length=1)
+    session_key: str = Field(..., min_length=1)
+    agent_id: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+class CaptureResponse(BaseModel):
+    messages_captured: int
+    memories_added: int
+    memory_ids: list[str]
+    duplicate: bool = False
+    messages_seen: int = 0
+    extract_status: str = "skipped"
+    user_id: Optional[str] = None
 
 
 class SearchRequest(BaseModel):
@@ -48,9 +68,25 @@ class MemoryResult(BaseModel):
     metadata: Optional[dict] = None
 
 
+class MemoryTrust(BaseModel):
+    user_id: str
+    l0_count: int = 0
+    l1_count: int = 0
+    conversations_seen: int = 0
+    extraction_pending: bool = False
+    extraction_due: bool = False
+    last_extract_ok: Optional[bool] = None
+    last_extract_error: Optional[str] = None
+    last_extraction_at: Optional[datetime] = None
+    last_extract_attempt_at: Optional[datetime] = None
+    extraction_lag_seconds: Optional[float] = None
+    recall_trusted: bool = False
+
+
 class SearchResponse(BaseModel):
     results: list[MemoryResult]
     total: int
+    trust: Optional[MemoryTrust] = None
 
 
 class PersonaResponse(BaseModel):
@@ -58,6 +94,7 @@ class PersonaResponse(BaseModel):
     summary: str
     memory_count: int
     last_updated: Optional[datetime] = None
+    trust: Optional[MemoryTrust] = None
 
 
 class ScenarioResult(BaseModel):

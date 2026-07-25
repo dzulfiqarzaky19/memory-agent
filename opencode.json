@@ -5,6 +5,14 @@
       "type": "local",
       "command": ["docker", "exec", "-i", "memory-agent-app", "python", "memory_mcp.py"],
       "enabled": true
+    },
+    "codestructure": {
+      "type": "local",
+      "command": ["node", "D:/dev/projects/codestructure/dist/mcp.js"],
+      "enabled": true,
+      "environment": {
+        "CODESTRUCTURE_ROOT": "${workspaceFolder}"
+      }
     }
   }
 }

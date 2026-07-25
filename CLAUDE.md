@@ -5,12 +5,19 @@ Local-first, agent-agnostic memory layer for AI agents. PostgreSQL + pgvector ba
 ## For Other Agents Continuing This Work
 
 This project is an **MCP-connected memory layer** for AI agents. PostgreSQL + pgvector backend.
-The `opencode.json` in the project root connects the `memory` MCP server automatically.
-You do NOT need to understand the internal codebase — just use the MCP tools.
+The root `.mcp.json` / `opencode.json` connect **two independent** MCP servers:
+- `memory` — user/session facts (this repo, Docker stdio)
+- `codestructure` — code structure graph for the open workspace (sibling project `D:/dev/projects/codestructure`, no shared state)
+
+You do NOT need to understand either internal codebase — use the MCP tools.
 
 ### Memory Protocol (FOLLOW THIS)
 
-Every agent working here **MUST** follow this protocol using MCP tools:
+**L0 durability** is host-driven when the Claude Code plugin is installed
+(`integrations/claude-code` Stop hook → `POST /capture`). Do not rely on the
+model remembering to store turns for capture.
+
+Still use MCP for **recall**:
 
 **At session start**, recall the user persona:
 ```
@@ -22,7 +29,7 @@ Use the get_persona tool with the user's user_id
 Use the search_memories tool with the user's user_id and a brief query summary
 ```
 
-**After each exchange**, store the conversation:
+**Manual store** (other hosts / plugin missing) via MCP:
 ```
 Use the store_memories tool with the user's user_id and the conversation formatted as:
 user: <message>
@@ -31,11 +38,31 @@ assistant: <response>
 
 ### Quick MCP Tool Reference
 
+**Memory** (user/session — `user_id=zaky` lowercase):
+
 | Tool | Purpose | Key params |
 |------|---------|------------|
 | `search_memories` | Recall before responding | `user_id`, `query` |
-| `store_memories` | Store after exchange | `user_id`, `messages` |
+| `store_memories` | Manual store if auto-capture unavailable | `user_id`, `messages` |
 | `get_persona` | User profile at session start | `user_id` |
+
+HTTP auto-capture: `POST /capture` with `user_id`, `session_key`, `messages`.
+
+**Code structure** (this workspace’s TS/JS/Python graph — separate process):
+
+| Tool | Purpose |
+|------|---------|
+| `cs_status` | Trust / stale / exact reindex command |
+| `cs_search` | Find symbol by name |
+| `cs_explore` | One symbol/file: callers, calls, imports, bindings |
+| `cs_callers` / `cs_callees` | Call edges |
+| `cs_impact` | Blast radius (`direction=up\|down\|both`) |
+| `cs_reindex` | Incremental reindex when trust=stale |
+
+Prefer `cs_*` over blind grep for navigation. Memory ≠ code graph — never store code structure into memories or vice versa.
+
+Prerequisite once per machine: `cd D:/dev/projects/codestructure && npm run build`.  
+First open of a repo: `cs_reindex` with `full=true` or CLI `node dist/cli.js init <repo>`.
 
 ### Key Principles (do not violate)
 

@@ -1,0 +1,16 @@
+{
+  "name": "memory-agent-integrations",
+  "owner": {
+    "name": "memory-agent"
+  },
+  "metadata": {
+    "description": "Host adapters for memory-agent (Claude Code auto-capture + MCP)."
+  },
+  "plugins": [
+    {
+      "name": "memory-agent",
+      "source": "./claude-code",
+      "description": "Auto-capture Claude Code turns into local memory-agent and expose search/persona MCP tools."
+    }
+  ]
+}

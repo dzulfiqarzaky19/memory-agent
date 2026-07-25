@@ -1,0 +1,16 @@
+{
+  "description": "Auto-capture each Claude Code turn into local memory-agent via POST /capture",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/auto-capture.cjs\"",
+            "statusMessage": "Capturing turn to memory-agent"
+          }
+        ]
+      }
+    ]
+  }
+}

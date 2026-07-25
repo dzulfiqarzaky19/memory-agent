@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Usage:
+#   ./scripts/setup.sh
+#   ./scripts/setup.sh --claude        # also install Claude Code plugin
+#   ./scripts/setup.sh --claude-only   # plugin only
+
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
+
+CLAUDE=0
+CLAUDE_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --claude) CLAUDE=1 ;;
+    --claude-only) CLAUDE_ONLY=1 ;;
+    -h|--help)
+      echo "Usage: $0 [--claude] [--claude-only]"
+      exit 0
+      ;;
+  esac
+done
 
 # ── Colors ──────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -10,6 +28,41 @@ info()  { echo -e "  ${GREEN}==${NC} $*"; }
 warn()  { echo -e "  ${YELLOW}==${NC} $*"; }
 fail()  { echo -e "  ${RED}==${NC} $*"; exit 1; }
 header(){ echo -e "\n${CYAN}$*${NC}"; }
+
+install_claude_plugin() {
+  header "▸ Claude Code plugin (auto-capture)"
+  local integrations="$REPO_DIR/integrations"
+  local plugin_dir="$integrations/claude-code"
+  if [ ! -f "$plugin_dir/.claude-plugin/plugin.json" ]; then
+    fail "Plugin missing at $plugin_dir"
+  fi
+  if ! command -v claude &>/dev/null; then
+    warn "claude CLI not on PATH — wire manually:"
+    echo "  claude plugin marketplace add \"$integrations\""
+    echo "  claude plugin install memory-agent@memory-agent-integrations -s user"
+    return 0
+  fi
+  info "Validating manifests"
+  claude plugin validate "$plugin_dir" || true
+  claude plugin validate "$integrations" || true
+  info "Adding local marketplace"
+  claude plugin marketplace add "$integrations" || true
+  info "Installing memory-agent@memory-agent-integrations"
+  if claude plugin install "memory-agent@memory-agent-integrations" -s user; then
+    info "Plugin installed. Restart Claude Code / open a new session."
+  else
+    warn "plugin install failed — retry: claude plugin install memory-agent@memory-agent-integrations -s user"
+  fi
+  echo ""
+  echo "  Optional env: MEMORY_AGENT_URL MEMORY_AGENT_USER_ID MEMORY_API_SECRET"
+  echo "  (or ~/.memory-agent/api-secret for the Stop hook)"
+  echo "  Capture log: ~/.claude/hooks/logs/memory-auto-capture.jsonl"
+}
+
+if [ "$CLAUDE_ONLY" -eq 1 ]; then
+  install_claude_plugin
+  exit 0
+fi
 
 # ── 1. Prerequisites ────────────────────────────
 header "▸ Checking prerequisites"
@@ -27,6 +80,51 @@ if [ ! -f ".env" ]; then
   info "Created .env from .env.example"
 else
   warn ".env already exists — will not overwrite"
+fi
+
+# Door: MEMORY_API_SECRET in .env + ~/.memory-agent/api-secret (value never printed).
+header "▸ API door (localhost + shared secret)"
+door_out="$(python3 - <<'PY' 2>/dev/null || python - <<'PY'
+import secrets, pathlib, os, re
+root = pathlib.Path(".")
+env_path = root / ".env"
+text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+m = re.search(r"(?m)^MEMORY_API_SECRET=(.*)$", text)
+secret = (m.group(1).strip().strip('"').strip("'") if m else "") or ""
+if not secret:
+    secret = secrets.token_urlsafe(32)
+    if m:
+        text = re.sub(r"(?m)^MEMORY_API_SECRET=.*$", f"MEMORY_API_SECRET={secret}", text)
+    else:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += "\n# HTTP door — clients send header X-Memory-Key\n"
+        text += f"MEMORY_API_SECRET={secret}\n"
+        if "MEMORY_ALLOW_RELOAD=" not in text:
+            text += "MEMORY_ALLOW_RELOAD=false\n"
+    env_path.write_text(text, encoding="utf-8")
+    print("generated")
+else:
+    print("exists")
+home = pathlib.Path(os.path.expanduser("~")) / ".memory-agent"
+home.mkdir(parents=True, exist_ok=True)
+sec_file = home / "api-secret"
+sec_file.write_text(secret + "\n", encoding="utf-8")
+try:
+    os.chmod(sec_file, 0o600)
+except Exception:
+    pass
+print(str(sec_file))
+PY
+)" || true
+if [ -z "${door_out:-}" ]; then
+  warn "Could not ensure MEMORY_API_SECRET — set it in .env manually."
+else
+  status="$(printf '%s\n' "$door_out" | head -n1)"
+  sec_path="$(printf '%s\n' "$door_out" | sed -n '2p')"
+  if [ "$status" = "generated" ]; then info "Generated MEMORY_API_SECRET in .env"; else info "MEMORY_API_SECRET already set in .env"; fi
+  [ -n "$sec_path" ] && info "Host secret file: $sec_path (Stop hook reads if env unset)"
+  info "HTTP published on 127.0.0.1 only; /reload off unless MEMORY_ALLOW_RELOAD=true"
 fi
 
 # ── 3. Provider picker ──────────────────────────
@@ -149,15 +247,27 @@ for i in $(seq 1 30); do
   fi
 done
 
-# ── 7. Harness configs ──────────────────────────
+# ── 7. Optional Claude Code plugin ─────────────
+if [ "$CLAUDE" -eq 1 ]; then
+  install_claude_plugin
+fi
+
+# ── 8. Harness configs ──────────────────────────
 header "▸ Setup complete"
 echo -e "  ${GREEN}Memory agent is running at http://localhost:8000${NC}"
 echo -e "  ${GREEN}Database: PostgreSQL 16 + pgvector on port 5433${NC}"
+echo -e "  ${GREEN}Auto-capture API: POST http://localhost:8000/capture${NC}"
 
 echo ""
-echo -e "  ${CYAN}── MCP Config ─────────────────────────────${NC}"
-echo "  Add to your AI tool's MCP settings:"
+echo -e "  ${CYAN}── Claude Code (easiest) ──────────────────${NC}"
+if [ "$CLAUDE" -eq 0 ]; then
+  echo "  Re-run with --claude to install the auto-capture plugin:"
+  echo "    ./scripts/setup.sh --claude-only"
+else
+  echo "  Plugin install attempted above. New session → turns auto-save to L0."
+fi
 echo ""
+echo -e "  ${CYAN}── MCP Config (other tools) ───────────────${NC}"
 echo -e "  ${YELLOW}opencode.json / .mcp.json:${NC}"
 echo '  {'
 echo '    "mcpServers": {'
@@ -168,9 +278,7 @@ echo '      }'
 echo '    }'
 echo '  }'
 echo ""
-echo -e "  ${YELLOW}Or use the HTTP API directly:${NC}"
-echo '  curl http://localhost:8000/health'
-echo '  curl -X POST http://localhost:8000/add -H "Content-Type: application/json" -d "{...}"'
-echo ""
 echo -e "  ${CYAN}── Quick test ──────────────────────────────${NC}"
 echo '  curl -s http://localhost:8000/health'
+echo '  curl -s -X POST http://localhost:8000/capture -H "Content-Type: application/json" \'
+echo '    -d "{\"user_id\":\"demo\",\"session_key\":\"s1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hey\"}]}"'

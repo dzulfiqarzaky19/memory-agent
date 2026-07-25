@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
+from config import MEMORY_ALLOW_RELOAD, MEMORY_API_SECRET, MEMORY_BIND_HOST
 from embeddings import create_embedding_provider
 from extraction import LLMExtractor
 from memory import MemoryEngine
 from models import (
     AddRequest,
     AddResponse,
+    CaptureRequest,
+    CaptureResponse,
     HealthResponse,
+    MemoryTrust,
     PersonaResponse,
     ReloadConfig,
     ReloadResponse,
@@ -23,6 +29,43 @@ from models import (
     MemoryResult,
 )
 from storage import Storage
+
+# Open without secret (liveness only). Everything else needs X-Memory-Key when set.
+_AUTH_OPEN_PATHS = frozenset({"/health"})
+
+
+def _trust_model(trust: Optional[dict]) -> Optional[MemoryTrust]:
+    if not trust:
+        return None
+    return MemoryTrust(**trust)
+
+
+def _secret_ok(provided: str | None) -> bool:
+    expected = MEMORY_API_SECRET
+    if not expected:
+        return True
+    got = provided or ""
+    return hmac.compare_digest(got, expected)
+
+
+class MemoryKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        path = request.url.path
+        if path in _AUTH_OPEN_PATHS:
+            return await call_next(request)
+        if not MEMORY_API_SECRET:
+            return await call_next(request)
+        key = request.headers.get("x-memory-key")
+        if not _secret_ok(key):
+            return Response(
+                content='{"detail":"unauthorized"}',
+                status_code=401,
+                media_type="application/json",
+            )
+        return await call_next(request)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,13 +81,19 @@ async def lifespan(app: FastAPI):
     embedder = create_embedding_provider()
     extractor = LLMExtractor()
     engine = MemoryEngine(storage=storage, embedder=embedder, extractor=extractor)
-    logger.info("Memory agent started")
+    if MEMORY_API_SECRET:
+        logger.info("Memory agent started (API key required)")
+    else:
+        logger.warning(
+            "Memory agent started with MEMORY_API_SECRET unset — HTTP routes open on bind host"
+        )
     yield
     await storage.close()
     logger.info("Memory agent stopped")
 
 
 app = FastAPI(title="memory-agent", version="0.1.0", lifespan=lifespan)
+app.add_middleware(MemoryKeyMiddleware)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -56,6 +105,23 @@ async def health():
         database="connected",
         memory_count=count,
     )
+
+
+@app.get("/config/llm")
+async def llm_config():
+    """Non-secret LLM wiring check (values from env via config.py)."""
+    from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
+
+    key = LLM_API_KEY or ""
+    return {
+        "LLM_PROVIDER": LLM_PROVIDER,
+        "LLM_MODEL": LLM_MODEL,
+        "LLM_BASE_URL": LLM_BASE_URL,
+        "LLM_API_KEY_set": bool(key),
+        "LLM_API_KEY_len": len(key),
+        "MEMORY_API_SECRET_set": bool(MEMORY_API_SECRET),
+        "MEMORY_ALLOW_RELOAD": MEMORY_ALLOW_RELOAD,
+    }
 
 
 @app.post("/add", response_model=AddResponse)
@@ -70,17 +136,34 @@ async def add_memories(req: AddRequest):
     return AddResponse(
         memories_added=result["memories_added"],
         memory_ids=result["memory_ids"],
+        extract_status=result.get("extract_status", "skipped"),
+        user_id=result.get("user_id"),
     )
+
+
+@app.post("/capture", response_model=CaptureResponse)
+async def capture_messages(req: CaptureRequest):
+    """Host auto-capture (agent-end). Idempotent per session_key + batch hash."""
+    messages = [m.model_dump() for m in req.messages]
+    result = await engine.capture(
+        user_id=req.user_id,
+        session_key=req.session_key,
+        messages=messages,
+        agent_id=req.agent_id,
+        metadata=req.metadata,
+    )
+    return CaptureResponse(**result)
 
 
 @app.post("/search", response_model=SearchResponse)
 async def search_memories(req: SearchRequest):
-    results = await engine.search(
+    payload = await engine.search(
         user_id=req.user_id,
         query=req.query,
         top_k=req.top_k,
         agent_id=req.agent_id,
     )
+    results = payload["results"]
     return SearchResponse(
         results=[
             MemoryResult(
@@ -94,18 +177,27 @@ async def search_memories(req: SearchRequest):
             )
             for r in results
         ],
-        total=len(results),
+        total=payload["total"],
+        trust=_trust_model(payload.get("trust")),
     )
 
 
 @app.get("/persona/{user_id}", response_model=PersonaResponse)
 async def get_persona(user_id: str):
     result = await engine.get_persona(user_id)
-    return PersonaResponse(**result)
+    return PersonaResponse(
+        user_id=result["user_id"],
+        summary=result["summary"],
+        memory_count=result["memory_count"],
+        last_updated=result.get("last_updated"),
+        trust=_trust_model(result.get("trust")),
+    )
 
 
 @app.post("/reload", response_model=ReloadResponse)
 async def reload_config(req: ReloadConfig):
+    if not MEMORY_ALLOW_RELOAD:
+        raise HTTPException(status_code=404, detail="not found")
     engine.extractor.reconfigure(
         model=req.model,
         base_url=req.base_url,
@@ -131,4 +223,5 @@ async def get_scenarios(user_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(app, host=MEMORY_BIND_HOST, port=8000)

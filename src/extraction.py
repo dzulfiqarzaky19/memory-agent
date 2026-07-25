@@ -91,11 +91,24 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def _parse_json_object(text: str) -> dict:
+    """Parse first JSON object from model output (tolerates fences / trailing junk)."""
+    cleaned = _strip_markdown(text)
+    decoder = json.JSONDecoder()
+    start = cleaned.find("{")
+    if start < 0:
+        raise json.JSONDecodeError("no JSON object in LLM response", cleaned, 0)
+    parsed, _ = decoder.raw_decode(cleaned, start)
+    if not isinstance(parsed, dict):
+        raise json.JSONDecodeError("LLM JSON root is not an object", cleaned, start)
+    return parsed
+
+
 class LLMExtractor:
     def __init__(self):
         self._provider = LLM_PROVIDER
         self._model = LLM_MODEL
-        self._base_url = (LLM_BASE_URL or "https://api.openai.com/v1").rstrip("/")
+        self._base_url = LLM_BASE_URL.rstrip("/") if LLM_BASE_URL else ""
         self._api_key = LLM_API_KEY
         self._max_tokens = LLM_MAX_TOKENS
 
@@ -104,28 +117,39 @@ class LLMExtractor:
             if v is not None:
                 setattr(self, f"_{k}", v)
 
+    def _require_llm(self) -> None:
+        missing = [
+            name
+            for name, val in (
+                ("LLM_BASE_URL", self._base_url),
+                ("LLM_MODEL", self._model),
+                ("LLM_API_KEY", self._api_key),
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(
+                "LLM not configured — set in .env: " + ", ".join(missing)
+                + (f" (LLM_PROVIDER={self._provider!r})" if self._provider else "")
+            )
+
     async def extract_memories(
         self,
         messages_text: str,
         existing_memories: Optional[list[str]] = None,
     ) -> list[dict]:
+        """Return atoms, or raise on LLM/parse failure (empty list = genuine no facts)."""
         user_prompt = build_extraction_prompt(messages_text, existing_memories)
-
-        try:
-            response_text = await self._call_llm(
-                system=SYSTEM_PROMPT,
-                user=user_prompt,
-            )
-            response_text = _strip_markdown(response_text)
-            parsed = json.loads(response_text)
-            memories = parsed.get("memories", [])
-            if not isinstance(memories, list):
-                return []
-            atoms = [atom for m in memories if (atom := _normalize_atom(m))]
-            return atoms[:EXTRACTION_MAX_MEMORIES]
-        except Exception as e:
-            logger.error(f"Memory extraction failed: {e}")
-            return []
+        response_text = await self._call_llm(
+            system=SYSTEM_PROMPT,
+            user=user_prompt,
+        )
+        parsed = _parse_json_object(response_text)
+        memories = parsed.get("memories", [])
+        if not isinstance(memories, list):
+            raise ValueError("LLM memories field is not a list")
+        atoms = [atom for m in memories if (atom := _normalize_atom(m))]
+        return atoms[:EXTRACTION_MAX_MEMORIES]
 
     async def group_into_scenarios(
         self,
@@ -165,8 +189,7 @@ Only include scenarios with at least 1 memory."""
                 system="You are a memory clustering engine. Group related facts into named contextual scenarios.",
                 user=prompt,
             )
-            response_text = _strip_markdown(response_text)
-            parsed = json.loads(response_text)
+            parsed = _parse_json_object(response_text)
             scenarios = parsed.get("scenarios", [])
             if not isinstance(scenarios, list):
                 return []
@@ -206,6 +229,7 @@ Persona:"""
             return "No persona available yet."
 
     async def _call_llm(self, system: str, user: str) -> str:
+        self._require_llm()
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
                 f"{self._base_url}/chat/completions",
@@ -220,5 +244,23 @@ Persona:"""
                     "temperature": 0.1,
                 },
             )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            body = resp.text
+            if resp.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"LLM HTTP {resp.status_code}: {body[:400]}",
+                    request=resp.request,
+                    response=resp,
+                )
+            data = _parse_json_object(body)
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as e:
+                raise RuntimeError(f"unexpected LLM response shape: {body[:400]}") from e
+            if isinstance(content, list):
+                # OpenAI-style multipart content blocks
+                content = "".join(
+                    (b.get("text") or "") if isinstance(b, dict) else str(b) for b in content
+                )
+            if not isinstance(content, str):
+                content = str(content)
+            return content
