@@ -227,7 +227,7 @@ class Storage:
                      AND 1 - (embedding <=> $1::vector) >= $3
                      AND ($4::text IS NULL OR agent_id = $4 OR agent_id IS NULL)
                    ORDER BY embedding <=> $1::vector
-                   LIMIT $5""",
+                    LIMIT $5""",
                 json.dumps(query_embedding),
                 user_id,
                 threshold,
@@ -442,7 +442,7 @@ class Storage:
                    WHERE user_id = $2
                      AND 1 - (embedding <=> $1::vector) >= $3
                    ORDER BY embedding <=> $1::vector
-                   LIMIT $4""",
+                    LIMIT $4""",
                 json.dumps(query_embedding),
                 user_id,
                 threshold,

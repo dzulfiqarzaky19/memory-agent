@@ -79,3 +79,16 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     memory_count: int
+
+
+class ReloadConfig(BaseModel):
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    max_tokens: Optional[int] = None
+
+
+class ReloadResponse(BaseModel):
+    status: str
+    model: str
+    base_url: str

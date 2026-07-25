@@ -61,5 +61,18 @@ async def get_persona(user_id: str) -> str:
     return f"[{data['memory_count']} memories] {data['summary']}"
 
 
+@MCP.tool()
+async def reload_config(model: str, base_url: str = "") -> str:
+    """Hot-swap the LLM model/config without restarting the server."""
+    body = {"model": model}
+    if base_url:
+        body["base_url"] = base_url
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(f"{API_BASE}/reload", json=body)
+        r.raise_for_status()
+        data = r.json()
+    return f"Switched to model={data['model']} at {data['base_url']}"
+
+
 if __name__ == "__main__":
     MCP.run(transport="stdio")

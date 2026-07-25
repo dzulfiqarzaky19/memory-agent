@@ -15,6 +15,8 @@ from models import (
     AddResponse,
     HealthResponse,
     PersonaResponse,
+    ReloadConfig,
+    ReloadResponse,
     ScenarioResult,
     ScenariosResponse,
     SearchRequest,
@@ -101,6 +103,21 @@ async def search_memories(req: SearchRequest):
 async def get_persona(user_id: str):
     result = await engine.get_persona(user_id)
     return PersonaResponse(**result)
+
+
+@app.post("/reload", response_model=ReloadResponse)
+async def reload_config(req: ReloadConfig):
+    engine.extractor.reconfigure(
+        model=req.model,
+        base_url=req.base_url,
+        api_key=req.api_key,
+        max_tokens=req.max_tokens,
+    )
+    return ReloadResponse(
+        status="ok",
+        model=engine.extractor._model,
+        base_url=engine.extractor._base_url,
+    )
 
 
 @app.get("/scenarios/{user_id}", response_model=ScenariosResponse)

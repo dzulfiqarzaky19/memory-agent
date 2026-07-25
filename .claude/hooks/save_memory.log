@@ -1,0 +1,35 @@
+[2026-07-12T12:03:16.545Z] skipped: no transcript_path (/c/Users/Zaky/.claude/projects/d--dev-projects-memory-agent/8520c396-e833-477a-a723-727012fc2016.jsonl)
+[2026-07-12T12:03:30.933Z] bad stdin JSON: Bad escaped character in JSON at position 43 (line 1 column 44)
+[2026-07-12T12:03:39.401Z] skipped: no transcript_path (C:UsersZaky.claudeprojectsd--dev-projects-memory-agent8520c396-e833-477a-a723-727012fc2016.jsonl)
+[2026-07-12T12:03:48.358Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:04:51.740Z] store error: The operation was aborted due to timeout
+[2026-07-12T12:06:15.197Z] stored ok: memories_added=0
+[2026-07-12T12:14:33.064Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:15:44.142Z] skipped: stop_hook_active=true (loop guard)
+[2026-07-12T12:18:40.381Z] stored ok: memories_added=0
+[2026-07-12T12:18:54.693Z] skipped: stop_hook_active=true (loop guard)
+[2026-07-12T12:21:58.429Z] stored ok: memories_added=0
+[2026-07-12T12:24:24.162Z] stored ok: memories_added=0
+[2026-07-12T12:24:50.111Z] skipped: stop_hook_active=true (loop guard)
+[2026-07-12T12:25:27.968Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:27:47.684Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:32:26.256Z] stored ok: memories_added=0
+[2026-07-12T12:41:31.971Z] skipped: stop_hook_active=true (loop guard)
+[2026-07-12T12:41:48.457Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:42:00.275Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:42:17.151Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:42:35.262Z] store error: The operation was aborted due to timeout
+[2026-07-12T12:43:39.378Z] skipped: no transcript_path (/c/Users/Zaky/.claude/projects/d--dev-projects-memory-agent/8520c396-e833-477a-a723-727012fc2016.jsonl)
+[2026-07-12T12:43:50.677Z] bad stdin JSON: Bad escaped character in JSON at position 24 (line 1 column 25)
+[2026-07-12T12:44:37.547Z] stored ok: memories_added=0
+[2026-07-12T12:47:00.685Z] store error: The operation was aborted due to timeout
+[2026-07-12T12:48:30.619Z] stored ok: memories_added=0
+[2026-07-12T12:50:14.887Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:51:34.989Z] stored ok: memories_added=0
+[2026-07-12T12:54:15.842Z] stored ok: memories_added=0
+[2026-07-12T12:54:18.734Z] store error: The operation was aborted due to timeout
+[2026-07-12T12:54:32.959Z] skipped: stop_hook_active=true (loop guard)
+[2026-07-12T12:55:25.323Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:55:39.959Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T12:55:51.232Z] skipped: empty exchange (user=true, assistant=false)
+[2026-07-12T13:04:13.500Z] stored ok: memories_added=0

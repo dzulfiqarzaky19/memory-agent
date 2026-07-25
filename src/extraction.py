@@ -92,6 +92,11 @@ class LLMExtractor:
         self._api_key = LLM_API_KEY
         self._max_tokens = LLM_MAX_TOKENS
 
+    def reconfigure(self, **kwargs):
+        for k, v in kwargs.items():
+            if v is not None:
+                setattr(self, f"_{k}", v)
+
     async def extract_memories(
         self,
         messages_text: str,
