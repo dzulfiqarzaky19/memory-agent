@@ -14,8 +14,14 @@ user: <their message>
 assistant: <your response>
 ```
 
-**Always** use MCP for recall: `get_persona` at session start, `search_memories`
-before answering when prior context may matter. Read the trust banner —
-`recall_trusted=false` means empty ≠ “user has no prefs.”
+**Session start is host-injected.** The plugin's SessionStart hook posts the partner
+pack (other + self + relation) into context automatically — do not call anything to
+get it. `get_partner` (MCP) only *refreshes* it mid-session, or covers hosts without
+the plugin. `get_persona` remains the generate-on-demand path when the pack shows
+`(no persona cached yet)`.
+
+**Always** use MCP for recall: `search_memories` before answering when prior context
+may matter. Read the trust banner — `recall_trusted=false` / `stale` means results may
+lag, and empty ≠ "user has no prefs."
 
 Skip store only if the user says "don't save this" or the exchange is pure tool noise.

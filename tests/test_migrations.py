@@ -70,6 +70,19 @@ async def test_baseline_skips_001_on_populated_db(db):
 
 
 @pytest.mark.asyncio
+async def test_partner_facts_table_exists(db):
+    async with db._pool.acquire() as conn:
+        assert await conn.fetchval("SELECT to_regclass('public.partner_facts') IS NOT NULL")
+        idx = await conn.fetchval(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_partner_dedupe'"
+        )
+    # Dedupe is per (user, agent, kind) — never shares the user's L1 hash namespace.
+    assert "UNIQUE" in idx
+    for col in ("user_id", "agent_id", "kind", "text_hash"):
+        assert col in idx
+
+
+@pytest.mark.asyncio
 async def test_extraction_jobs_table_exists(db):
     async with db._pool.acquire() as conn:
         assert await conn.fetchval("SELECT to_regclass('public.extraction_jobs') IS NOT NULL")

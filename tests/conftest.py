@@ -90,6 +90,7 @@ _TEST_TABLES = (
     "extraction_jobs",
     "personas",
     "capture_checkpoints",
+    "partner_facts",
 )
 
 

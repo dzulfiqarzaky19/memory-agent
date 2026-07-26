@@ -599,6 +599,123 @@ class Storage:
             )
         return [_memory_row(r, score=0.0) for r in rows]
 
+    # -- Partner facts (agent self / relation; isolated from user L1) --
+
+    async def get_partner_facts(
+        self,
+        user_id: str,
+        agent_id: str,
+        kind: str,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Facts for exactly one agent.
+
+        Strict `agent_id = $2` on purpose — unlike the soft user-L1 filter
+        (`IS NULL OR agent_id = $n`), a self-spine belongs to one agent and must
+        not blend with another's.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, text, priority, metadata, created_at
+                   FROM partner_facts
+                   WHERE user_id = $1 AND agent_id = $2 AND kind = $3
+                   ORDER BY priority DESC, created_at DESC
+                   LIMIT $4""",
+                user_id,
+                agent_id,
+                kind,
+                limit,
+            )
+        return [
+            {
+                "id": r["id"],
+                "text": r["text"],
+                "priority": r["priority"],
+                "metadata": json.loads(r["metadata"])
+                if isinstance(r["metadata"], str)
+                else r["metadata"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    async def save_partner_fact(
+        self,
+        user_id: str,
+        agent_id: str,
+        kind: str,
+        text: str,
+        priority: int = 50,
+        metadata: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Append a partner fact. Returns None on duplicate (same contract as save_memory)."""
+        text_hash = hashlib.md5(text.encode()).hexdigest()
+        row_id = str(uuid4())
+        async with self._pool.acquire() as conn:
+            got = await conn.fetchval(
+                """INSERT INTO partner_facts
+                       (id, user_id, agent_id, kind, text, text_hash, priority, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   ON CONFLICT (user_id, agent_id, kind, text_hash) DO NOTHING
+                   RETURNING id""",
+                row_id,
+                user_id,
+                agent_id,
+                kind,
+                text,
+                text_hash,
+                priority,
+                json.dumps(metadata or {}),
+            )
+        return got
+
+    async def count_partner_facts(
+        self, user_id: str, agent_id: Optional[str] = None
+    ) -> int:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                """SELECT COUNT(*) FROM partner_facts
+                   WHERE user_id = $1 AND ($2::text IS NULL OR agent_id = $2)""",
+                user_id,
+                agent_id,
+            )
+
+    async def get_top_episodic(
+        self,
+        user_id: str,
+        min_priority: int = 70,
+        limit: int = 5,
+    ) -> list[dict]:
+        """High-priority user episodic, read-only fill for a thin relation slice.
+
+        Never copied into partner_facts — composed at read time only.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, text, priority, metadata, created_at
+                   FROM memories
+                   WHERE user_id = $1
+                     AND mem_type = 'episodic'
+                     AND priority >= $2
+                   ORDER BY priority DESC, created_at DESC
+                   LIMIT $3""",
+                user_id,
+                min_priority,
+                limit,
+            )
+        return [
+            {
+                "id": r["id"],
+                "text": r["text"],
+                "priority": r["priority"],
+                "metadata": json.loads(r["metadata"])
+                if isinstance(r["metadata"], str)
+                else r["metadata"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
     async def check_duplicate(self, user_id: str, text: str) -> bool:
         text_hash = hashlib.md5(text.encode()).hexdigest()
         async with self._pool.acquire() as conn:
@@ -1156,10 +1273,13 @@ class Storage:
             await conn.execute(
                 "DELETE FROM capture_checkpoints WHERE user_id = $1", user_id
             )
+            await conn.execute("DELETE FROM partner_facts WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM extraction_jobs WHERE user_id = $1", user_id)
 
     async def wipe_all(self) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """TRUNCATE conversations, memories, scenarios, extraction_state,
-                          personas, capture_checkpoints"""
+                          personas, capture_checkpoints, partner_facts,
+                          extraction_jobs"""
             )

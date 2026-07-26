@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from config import RECALL_MAX_RESULTS
 
@@ -110,6 +110,51 @@ class PersonaResponse(BaseModel):
     stale: bool = False
     stale_seconds: int = 0
     trust: Optional[MemoryTrust] = None
+
+
+class PartnerFact(BaseModel):
+    text: str
+    priority: int = 50
+    id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    # seed = static spine, stored = explicit write, user_episodic = read-only fill
+    source: str = "stored"
+
+
+class PartnerOther(BaseModel):
+    summary: Optional[str] = None
+    memory_count: int = 0
+    last_updated: Optional[datetime] = None
+    instructions: list[PartnerFact] = []
+
+
+class PartnerResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: str
+    agent_id: str
+    other: PartnerOther
+    # `self` is a Python keyword — expose it under that name on the wire only.
+    self_: list[PartnerFact] = Field(default=[], alias="self")
+    relation: list[PartnerFact] = []
+    stale: bool = False
+    stale_seconds: int = 0
+    trust: Optional[MemoryTrust] = None
+
+
+class PartnerFactRequest(BaseModel):
+    kind: str = Field(..., min_length=1, max_length=MAX_ID_CHARS)
+    text: str = Field(..., min_length=1, max_length=MAX_CONTENT_CHARS)
+    priority: int = Field(default=50, ge=0, le=100)
+    agent_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
+
+
+class PartnerFactResponse(BaseModel):
+    id: Optional[str] = None
+    user_id: str
+    agent_id: str
+    kind: str
+    duplicate: bool = False
 
 
 class ScenarioResult(BaseModel):

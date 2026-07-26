@@ -1,6 +1,17 @@
 {
-  "description": "Auto-capture each Claude Code turn into local memory-agent via POST /capture",
+  "description": "SessionStart injects the partner pack; Stop auto-captures each turn into local memory-agent.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/partner-pack.cjs\"",
+            "statusMessage": "Loading partner pack"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

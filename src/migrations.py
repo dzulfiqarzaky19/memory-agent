@@ -146,9 +146,35 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claim ON extraction_jobs(status, run_after)
     WHERE status IN ('queued','running');
 """
 
+MIGRATION_003_PARTNER_FACTS = """
+-- Partner pack: agent thin self + relation scars. Deliberately NOT in `memories`.
+-- User read paths (search_*, get_all_memories, count_memories) filter nothing by
+-- type, so agent-owned rows there would leak into recall, feed persona generation,
+-- and inflate l1_count/recall_trusted. A separate table keeps that isolation
+-- structural instead of a filter every future query has to remember.
+-- No embedding column: fetched by (user_id, agent_id, kind), never vector-searched.
+CREATE TABLE IF NOT EXISTS partner_facts (
+    id         TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    user_id    TEXT NOT NULL,
+    agent_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    text_hash  TEXT NOT NULL,
+    priority   INT  NOT NULL DEFAULT 50,
+    metadata   JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_dedupe
+    ON partner_facts(user_id, agent_id, kind, text_hash);
+CREATE INDEX IF NOT EXISTS idx_partner_lookup
+    ON partner_facts(user_id, agent_id, kind, priority DESC, created_at DESC);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, MIGRATION_001_BASELINE),
     (2, MIGRATION_002_EXTRACTION_JOBS),
+    (3, MIGRATION_003_PARTNER_FACTS),
 ]
 
 

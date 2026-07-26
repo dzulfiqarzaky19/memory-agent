@@ -8,6 +8,10 @@ from typing import Optional
 from config import (
     EXTRACTION_EVERY_N_TURNS,
     EXTRACTION_MAX_LAG_SECONDS,
+    PARTNER_AGENT_ID,
+    PARTNER_MAX_FACTS,
+    PARTNER_MAX_INSTRUCTIONS,
+    PARTNER_RELATION_MIN_PRIORITY,
     PERSONA_EVERY_N_MEMORIES,
     RECALL_CONFLICT_DEMOTE,
     RECALL_CONFLICT_JACCARD,
@@ -20,11 +24,24 @@ from config import (
 from embeddings import EmbeddingProvider
 from extraction import LLMExtractor
 from ids import canonicalize_user_id
+from partner_seed import seed_facts
 from storage import Storage
 
 logger = logging.getLogger(__name__)
 
 SCENARIO_REBUILD_INTERVAL = 10
+PARTNER_KINDS = frozenset({"agent_self", "relation"})
+
+
+def _partner_fact(row: dict, source: str) -> dict:
+    """Normalize a stored row / instruction into the pack's fact shape."""
+    return {
+        "id": row.get("id"),
+        "text": row["text"],
+        "priority": row.get("priority") if row.get("priority") is not None else 50,
+        "created_at": row.get("created_at"),
+        "source": source,
+    }
 
 
 def _priority_weight(score: float, priority: Optional[int]) -> float:
@@ -557,6 +574,112 @@ class MemoryEngine:
         generated_at = await self.storage.save_persona_cache(uid, summary, count)
 
         return reply(summary, generated_at)
+
+    async def get_partner(
+        self,
+        user_id: str,
+        agent_id: Optional[str] = None,
+    ) -> dict:
+        """Session-start pack: other (user) + self (agent spine) + relation.
+
+        Cache-only for the persona summary — NEVER generates. A session-start hook
+        must not trigger a multi-minute LLM call (architecture.md invariant 1);
+        GET /persona/{id} remains the generate-on-demand path.
+        """
+        uid = canonicalize_user_id(user_id)
+        aid = (agent_id or PARTNER_AGENT_ID).strip() or PARTNER_AGENT_ID
+        trust = await self.memory_trust(uid)
+
+        cached = await self.storage.get_persona_cache(uid)
+        instructions = await self.storage.get_instructions(
+            uid, agent_id=aid, limit=PARTNER_MAX_INSTRUCTIONS
+        )
+
+        stored_self = await self.storage.get_partner_facts(
+            uid, aid, "agent_self", limit=PARTNER_MAX_FACTS
+        )
+        stored_relation = await self.storage.get_partner_facts(
+            uid, aid, "relation", limit=PARTNER_MAX_FACTS
+        )
+
+        # Seed is read-only and merged here, so a cold DB still has a spine.
+        self_facts = seed_facts("agent_self") + [
+            _partner_fact(f, "stored") for f in stored_self
+        ]
+        relation_facts = seed_facts("relation") + [
+            _partner_fact(f, "stored") for f in stored_relation
+        ]
+        if not stored_relation:
+            # Thin relation: compose from high-priority user episodic, read-only.
+            top = await self.storage.get_top_episodic(
+                uid,
+                min_priority=PARTNER_RELATION_MIN_PRIORITY,
+                limit=PARTNER_MAX_INSTRUCTIONS,
+            )
+            relation_facts += [_partner_fact(f, "user_episodic") for f in top]
+
+        self_facts.sort(key=lambda f: f["priority"], reverse=True)
+        relation_facts.sort(key=lambda f: f["priority"], reverse=True)
+
+        return {
+            "user_id": uid,
+            "agent_id": aid,
+            "other": {
+                "summary": cached["summary"] if cached else None,
+                "memory_count": trust["l1_count"],
+                "last_updated": cached["generated_at"] if cached else None,
+                "instructions": [
+                    _partner_fact(i, "stored") for i in instructions
+                ],
+            },
+            "self": self_facts,
+            "relation": relation_facts,
+            "stale": not trust.get("recall_trusted"),
+            "stale_seconds": int(trust.get("stale_seconds") or 0),
+            "trust": trust,
+        }
+
+    async def add_partner_fact(
+        self,
+        user_id: str,
+        kind: str,
+        text: str,
+        priority: int = 50,
+        agent_id: Optional[str] = None,
+    ) -> dict:
+        """Explicit delta write. Never auto-mined from a session.
+
+        Main shop agent only (architecture.md invariant 10): a spawn like
+        `flow-review-a3f9` must not be able to create its own spine. Reads stay
+        unrestricted — only writes are pinned.
+        """
+        uid = canonicalize_user_id(user_id)
+        if kind not in PARTNER_KINDS:
+            raise ValueError(f"kind must be one of {sorted(PARTNER_KINDS)}")
+        body = (text or "").strip()
+        if not body:
+            raise ValueError("text must be non-empty")
+        requested = (agent_id or "").strip()
+        if requested and requested != PARTNER_AGENT_ID:
+            raise ValueError(
+                f"partner writes are limited to the main shop agent "
+                f"{PARTNER_AGENT_ID!r}; refusing to create a spine for {requested!r}"
+            )
+        aid = requested or PARTNER_AGENT_ID
+        row_id = await self.storage.save_partner_fact(
+            user_id=uid,
+            agent_id=aid,
+            kind=kind,
+            text=body,
+            priority=max(0, min(100, int(priority))),
+        )
+        return {
+            "id": row_id,
+            "user_id": uid,
+            "agent_id": aid,
+            "kind": kind,
+            "duplicate": row_id is None,
+        }
 
     async def get_scenarios(self, user_id: str) -> dict:
         uid = canonicalize_user_id(user_id)

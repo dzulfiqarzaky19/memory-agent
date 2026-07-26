@@ -137,6 +137,40 @@ async def get_persona(user_id: str) -> str:
     return f"{banner}\n{note}\n[{data['memory_count']} memories] {data['summary']}".strip()
 
 
+def _fmt_facts(facts: list[dict], empty: str) -> str:
+    if not facts:
+        return f"  ({empty})"
+    return "\n".join(f"  - {f['text']}" for f in facts)
+
+
+@MCP.tool()
+async def get_partner(user_id: str, agent_id: str = "") -> str:
+    """Session-start partner pack: user profile + agent craft spine + relation norms."""
+    uid = canonicalize_user_id(user_id)
+    params = {"agent_id": agent_id} if agent_id else None
+    # 10s: the endpoint is cache-only (no LLM), so it belongs in the cheap tier.
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{API_BASE}/partner/{uid}", headers=_headers(), params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    other = data.get("other") or {}
+    summary = other.get("summary") or "(no persona cached yet — call get_persona to generate)"
+    parts = [
+        _trust_banner(data.get("trust")),
+        _stale_note(data),
+        f"OTHER — who {uid} is ({other.get('memory_count', 0)} memories):",
+        f"  {summary}",
+        "\nTheir standing instructions:",
+        _fmt_facts(other.get("instructions") or [], "none recorded"),
+        f"\nSELF — how {data.get('agent_id')} works:",
+        _fmt_facts(data.get("self") or [], "none"),
+        "\nRELATION — how we work together:",
+        _fmt_facts(data.get("relation") or [], "none recorded yet"),
+    ]
+    return "\n".join(p for p in parts if p).strip()
+
+
 @MCP.tool()
 async def reload_config(model: str, base_url: str = "") -> str:
     """Hot-swap the LLM model/config (server must set MEMORY_ALLOW_RELOAD=1)."""

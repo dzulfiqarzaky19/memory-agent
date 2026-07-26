@@ -26,6 +26,11 @@ from models import (
     CaptureResponse,
     HealthResponse,
     MemoryTrust,
+    PartnerFact,
+    PartnerFactRequest,
+    PartnerFactResponse,
+    PartnerOther,
+    PartnerResponse,
     PersonaResponse,
     ReloadConfig,
     ReloadResponse,
@@ -240,6 +245,41 @@ async def get_persona(user_id: str):
         stale_seconds=int(result.get("stale_seconds") or 0),
         trust=_trust_model(result.get("trust")),
     )
+
+
+@app.get("/partner/{user_id}", response_model=PartnerResponse)
+async def get_partner(user_id: str, agent_id: Optional[str] = None):
+    """Session-start pack: other + thin self + relation. Cache-only, no LLM."""
+    result = await engine.get_partner(user_id, agent_id=agent_id)
+    other = result["other"]
+    return PartnerResponse(
+        user_id=result["user_id"],
+        agent_id=result["agent_id"],
+        other=PartnerOther(
+            summary=other["summary"],
+            memory_count=other["memory_count"],
+            last_updated=other.get("last_updated"),
+            instructions=[PartnerFact(**f) for f in other["instructions"]],
+        ),
+        self=[PartnerFact(**f) for f in result["self"]],
+        relation=[PartnerFact(**f) for f in result["relation"]],
+        stale=bool(result.get("stale")),
+        stale_seconds=int(result.get("stale_seconds") or 0),
+        trust=_trust_model(result.get("trust")),
+    )
+
+
+@app.post("/partner/{user_id}", response_model=PartnerFactResponse)
+async def add_partner_fact(user_id: str, req: PartnerFactRequest):
+    """Explicit agent_self / relation delta. Never auto-mined from a session."""
+    result = await engine.add_partner_fact(
+        user_id=user_id,
+        kind=req.kind,
+        text=req.text,
+        priority=req.priority,
+        agent_id=req.agent_id,
+    )
+    return PartnerFactResponse(**result)
 
 
 @app.post("/reload", response_model=ReloadResponse)

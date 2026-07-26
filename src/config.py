@@ -56,6 +56,13 @@ EXTRACTION_RETRY_BACKOFF_SECONDS = int(
     os.getenv("EXTRACTION_RETRY_BACKOFF_SECONDS", "30")
 )
 
+# Partner pack: main shop agent owning the self/relation slice. No per-spawn PIDs.
+PARTNER_AGENT_ID = (os.getenv("PARTNER_AGENT_ID") or "claude-code").strip() or "claude-code"
+PARTNER_MAX_FACTS = int(os.getenv("PARTNER_MAX_FACTS", "20"))
+PARTNER_MAX_INSTRUCTIONS = int(os.getenv("PARTNER_MAX_INSTRUCTIONS", "5"))
+# Read-only fill for a thin relation slice (never copied into partner_facts).
+PARTNER_RELATION_MIN_PRIORITY = int(os.getenv("PARTNER_RELATION_MIN_PRIORITY", "70"))
+
 RECALL_STRATEGY = os.getenv("RECALL_STRATEGY", "hybrid")
 RECALL_MAX_RESULTS = int(os.getenv("RECALL_MAX_RESULTS", "10"))
 RECALL_SIMILARITY_THRESHOLD = float(os.getenv("RECALL_SIMILARITY_THRESHOLD", "0.3"))
