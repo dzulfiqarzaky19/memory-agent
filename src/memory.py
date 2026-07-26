@@ -156,7 +156,10 @@ class MemoryEngine:
                         )
                         if not pending:
                             if not mined_any:
-                                await self.storage.mark_extraction_success(uid)
+                                # Clear cadence only — keep prior watermark (not now()).
+                                await self.storage.mark_extraction_success(
+                                    uid, watermark_at=cursor_at
+                                )
                                 extract_status = "empty_window"
                             break
 
@@ -278,6 +281,10 @@ class MemoryEngine:
     ) -> dict:
         uid = canonicalize_user_id(user_id)
         trust = await self.memory_trust(uid)
+        # Untrusted recall must not look like answers — empty + trust banner only.
+        if not trust.get("recall_trusted"):
+            return {"results": [], "total": 0, "trust": trust}
+
         query_embedding = self.embedder.embed([query])[0]
         threshold = RECALL_SIMILARITY_THRESHOLD
 

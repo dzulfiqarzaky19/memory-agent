@@ -687,27 +687,20 @@ class Storage:
             for r in rows
         ]
 
-    async def get_memories_by_ids(
-        self, ids: list[str], user_id: Optional[str] = None
-    ) -> list[dict]:
+    async def get_memories_by_ids(self, ids: list[str], user_id: str) -> list[dict]:
+        """Fetch memories by id, always scoped to user_id (no cross-user leak)."""
+        if not user_id or not str(user_id).strip():
+            raise ValueError("user_id is required")
         if not ids:
             return []
         async with self._pool.acquire() as conn:
-            if user_id is None:
-                rows = await conn.fetch(
-                    """SELECT id, text, mem_type, priority, metadata, created_at
-                       FROM memories
-                       WHERE id = ANY($1::text[])""",
-                    ids,
-                )
-            else:
-                rows = await conn.fetch(
-                    """SELECT id, text, mem_type, priority, metadata, created_at
-                       FROM memories
-                       WHERE user_id = $1 AND id = ANY($2::text[])""",
-                    user_id,
-                    ids,
-                )
+            rows = await conn.fetch(
+                """SELECT id, text, mem_type, priority, metadata, created_at
+                   FROM memories
+                   WHERE user_id = $1 AND id = ANY($2::text[])""",
+                user_id,
+                ids,
+            )
         return [
             {
                 "id": r["id"],
@@ -719,6 +712,19 @@ class Storage:
             }
             for r in rows
         ]
+
+    async def count_stale_embeddings(self) -> int:
+        """Rows flagged after a dim rebuild wipe (vectors empty / unusable)."""
+        async with self._pool.acquire() as conn:
+            mem = await conn.fetchval(
+                """SELECT COUNT(*) FROM memories
+                   WHERE metadata ? '_embed_stale'"""
+            )
+            scen = await conn.fetchval(
+                """SELECT COUNT(*) FROM scenarios
+                   WHERE metadata ? '_embed_stale'"""
+            )
+        return int(mem or 0) + int(scen or 0)
 
     async def count_scenarios(self, user_id: Optional[str] = None) -> int:
         async with self._pool.acquire() as conn:
@@ -879,20 +885,20 @@ class Storage:
         user_id: str,
         watermark_at: Optional[datetime] = None,
     ) -> None:
-        """Cadence complete: clear counter and advance extraction watermark.
+        """Cadence complete: clear counter; set watermark only when provided.
 
-        watermark_at must be the newest L0 row *included* in the mined window
-        (not wall-clock now) so concurrent L0 during LLM work is not skipped.
+        watermark_at = newest L0 *included* in a mined window (not wall-clock now).
+        watermark_at=None keeps the prior cursor (empty_window must not jump to now()).
         """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO extraction_state
                        (user_id, conversations_seen, last_extraction_at,
                         last_extract_ok, last_extract_error, last_extract_attempt_at, updated_at)
-                   VALUES ($1, 0, COALESCE($2, now()), true, NULL, now(), now())
+                   VALUES ($1, 0, $2, true, NULL, now(), now())
                    ON CONFLICT (user_id) DO UPDATE SET
                        conversations_seen = 0,
-                       last_extraction_at = COALESCE($2, now()),
+                       last_extraction_at = COALESCE($2, extraction_state.last_extraction_at),
                        last_extract_ok = true,
                        last_extract_error = NULL,
                        last_extract_attempt_at = now(),

@@ -97,6 +97,12 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             f"live embed dim-check failed: got {got}, expected EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}"
         )
+    stale = await storage.count_stale_embeddings()
+    if stale:
+        raise RuntimeError(
+            f"{stale} memory/scenario row(s) have _embed_stale after a dim rebuild — "
+            "re-embed or wipe before serving recall"
+        )
     extractor = LLMExtractor()
     engine = MemoryEngine(storage=storage, embedder=embedder, extractor=extractor)
     if MEMORY_API_SECRET:

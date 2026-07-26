@@ -70,6 +70,22 @@ async def test_extract_pages_cold_backlog(engine, monkeypatch):
     assert leftover == []
 
 
+async def _trust_ready(engine, uid: str) -> None:
+    """Mark extract OK so seeded L1 is searchable under empty-when-untrusted policy."""
+    await engine.storage.mark_extraction_success(uid)
+
+
+@pytest.mark.asyncio
+async def test_get_memories_by_ids_requires_user_id(engine):
+    uid = "test-ids-req"
+    emb = engine.embedder.embed(["x"])[0]
+    mid = await engine.storage.save_memory(uid, "needs scope", emb)
+    with pytest.raises(TypeError):
+        await engine.storage.get_memories_by_ids([mid])  # type: ignore[call-arg]
+    with pytest.raises(ValueError):
+        await engine.storage.get_memories_by_ids([mid], user_id="")
+
+
 @pytest.mark.asyncio
 async def test_get_memories_by_ids_scoped_to_user(engine):
     uid_a = "test-ids-a"
@@ -290,6 +306,42 @@ async def test_user_id_canonicalized(engine):
 
 
 @pytest.mark.asyncio
+async def test_untrusted_search_returns_empty(engine):
+    uid = "test-untrusted-empty"
+    emb = engine.embedder.embed(["x"])[0]
+    await engine.storage.save_memory(uid, "Should not surface when untrusted", emb)
+    # L1 present but no successful extract → untrusted
+    payload = await engine.search(uid, "surface", top_k=5)
+    assert payload["results"] == []
+    assert payload["trust"]["recall_trusted"] is False
+
+
+@pytest.mark.asyncio
+async def test_empty_window_keeps_prior_watermark(engine, monkeypatch):
+    uid = "test-empty-wm"
+    prior = datetime.now(timezone.utc) - timedelta(days=1)
+    await engine.storage.mark_extraction_success(uid, watermark_at=prior)
+    monkeypatch.setattr("memory.EXTRACTION_EVERY_N_TURNS", 1)
+
+    async def no_pending(user_id, since=None, limit=200, after_id=None):
+        return []
+
+    monkeypatch.setattr(engine.storage, "get_conversations_since", no_pending)
+    r = await engine.add(
+        uid,
+        [{"role": "user", "content": "ping"}, {"role": "assistant", "content": "pong"}],
+    )
+    assert r["extract_status"] == "empty_window"
+    state = await engine.storage.get_extraction_state(uid)
+    # Must not jump to wall-clock now()
+    assert state["last_extraction_at"] is not None
+    got = state["last_extraction_at"]
+    if got.tzinfo is None:
+        got = got.replace(tzinfo=timezone.utc)
+    assert abs((got - prior).total_seconds()) < 2
+
+
+@pytest.mark.asyncio
 async def test_priority_and_instruction_recall(engine):
     uid = "test-priority-recall"
     emb = engine.embedder.embed(["x"])[0]
@@ -298,6 +350,7 @@ async def test_priority_and_instruction_recall(engine):
     await engine.storage.save_memory(uid, "Low priority fact", emb, priority=10)
     await engine.storage.save_memory(uid, "High priority fact", emb, priority=95)
     await engine.storage.save_memory(uid, "Never use emojis", emb, mem_type="instruction", priority=90)
+    await _trust_ready(engine, uid)
 
     results = (await engine.search(uid, "fact", top_k=10))["results"]
     texts = [r["text"] for r in results]
@@ -320,6 +373,7 @@ async def test_search_injects_fill_remaining_only(engine, monkeypatch):
     await engine.storage.save_memory(
         uid, "Always reply in English", emb, mem_type="instruction", priority=90
     )
+    await _trust_ready(engine, uid)
 
     # top_k=1: only primary match, no room for instruction inject.
     tight = (await engine.search(uid, "widgets", top_k=1))["results"]

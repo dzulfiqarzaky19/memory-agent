@@ -76,12 +76,12 @@ async def test_conversations_since(db):
     uid = "test-conv-since"
 
     await db.save_conversation(uid, "user", "old message")
-    # Stamp extraction boundary after the old message.
-    await db.bump_conversation_counter(uid, 1)
-    await db.reset_conversation_counter(uid)
+    # Stamp watermark at the old row (not wall-clock now via bare success).
+    old_rows = await db.get_conversations_since(uid, since=None, limit=10)
+    assert old_rows
+    await db.mark_extraction_success(uid, watermark_at=old_rows[-1]["created_at"])
 
-    state = await db.bump_conversation_counter(uid, 0)
-    # bump 0 still returns state; if conversations_seen was 0, stays 0
+    state = await db.get_extraction_state(uid)
     since = state["last_extraction_at"]
     assert since is not None
 

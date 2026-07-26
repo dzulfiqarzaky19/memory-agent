@@ -184,30 +184,33 @@ MEMORIES:
 Return a JSON object: {{"scenarios": [{{"name": "...", "description": "...", "memory_indices": [1, 2, 3]}}]}}
 Only include scenarios with at least 1 memory."""
 
-        try:
-            response_text = await self._call_llm(
-                system="You are a memory clustering engine. Group related facts into named contextual scenarios.",
-                user=prompt,
-            )
-            parsed = _parse_json_object(response_text)
-            scenarios = parsed.get("scenarios", [])
-            if not isinstance(scenarios, list):
-                return []
-            result = []
-            for s in scenarios:
-                if not isinstance(s, dict):
-                    continue
-                name = s.get("name", "").strip()
-                desc = s.get("description", "").strip()
-                indices = s.get("memory_indices", [])
-                if name and desc and isinstance(indices, list):
-                    # Convert 1-indexed to 0-indexed, filter valid
-                    valid = [i - 1 for i in indices if isinstance(i, int) and 1 <= i <= len(memory_texts)]
-                    result.append({"name": name, "description": desc, "memory_indices": valid})
-            return result
-        except Exception as e:
-            logger.error(f"Scenario grouping failed: {e}")
-            return []
+        # Raise on LLM/transport/parse failure — [] only means genuine empty grouping.
+        response_text = await self._call_llm(
+            system="You are a memory clustering engine. Group related facts into named contextual scenarios.",
+            user=prompt,
+        )
+        parsed = _parse_json_object(response_text)
+        scenarios = parsed.get("scenarios", [])
+        if not isinstance(scenarios, list):
+            raise ValueError("LLM scenarios field is not a list")
+        result = []
+        for s in scenarios:
+            if not isinstance(s, dict):
+                continue
+            name = s.get("name", "").strip()
+            desc = s.get("description", "").strip()
+            indices = s.get("memory_indices", [])
+            if name and desc and isinstance(indices, list):
+                # Convert 1-indexed to 0-indexed, filter valid
+                valid = [
+                    i - 1
+                    for i in indices
+                    if isinstance(i, int) and 1 <= i <= len(memory_texts)
+                ]
+                result.append(
+                    {"name": name, "description": desc, "memory_indices": valid}
+                )
+        return result
 
     async def generate_persona(self, memories: list[str]) -> str:
         memories_text = "\n".join(f"- {m}" for m in memories)

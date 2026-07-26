@@ -55,11 +55,15 @@ async def search_memories(user_id: str, query: str) -> str:
         r.raise_for_status()
         data = r.json()
     banner = _trust_banner(data.get("trust"))
-    if not data["results"]:
-        note = "No relevant memories found."
-        if data.get("trust") and not data["trust"].get("recall_trusted"):
-            note += " (recall untrusted — extraction lag or prior extract failure)"
+    if data.get("trust") and not data["trust"].get("recall_trusted"):
+        note = (
+            "Recall untrusted — no atoms returned. "
+            "Do not infer user prefs from empty results "
+            "(extraction lag, failure, or backlog)."
+        )
         return f"{banner}\n{note}".strip()
+    if not data["results"]:
+        return f"{banner}\nNo relevant memories found.".strip()
     lines = [
         f"- [{m['score']:.4f}] ({m.get('type') or 'memory'}) {m['text']}"
         for m in data["results"]
