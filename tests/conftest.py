@@ -75,6 +75,11 @@ async def engine(db: Storage) -> AsyncGenerator[Any, Any]:
 
 
 @pytest_asyncio.fixture(scope="function")
-async def client():
+async def client(monkeypatch):
+    # Lifespan runs a live embed dim-check; keep unit tests offline.
+    monkeypatch.setattr(
+        "server.create_embedding_provider",
+        lambda: FakeEmbedding(),
+    )
     with TestClient(app) as c:
         yield c

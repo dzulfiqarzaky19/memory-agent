@@ -67,7 +67,7 @@ Agent → POST /search(query)
 | `search_memories(user_id, query)` | Recall relevant memories | Before responding to user |
 | `store_memories(user_id, messages)` | Store exchange after replying | After each assistant response |
 | `get_persona(user_id)` | Get user profile summary | At session start |
-| `compact_context(user_id, messages, ...)` | Compress long context with memory injection | When approaching context limit |
+| `reload_config(model, base_url?)` | Hot-swap LLM (server must allow reload) | Ops only |
 
 ## Configuration — LLM & Embedding Providers
 
@@ -108,19 +108,23 @@ LLM_MAX_TOKENS=4096
 | **Groq** | `nomic-embed-text-v1.5` (768d) | `llama-3.3-70b-versatile` | `EMBEDDING_BASE_URL=https://api.groq.com/openai/v1`, `LLM_BASE_URL=https://api.groq.com/openai/v1`, `GROQ_API_KEY` as `LLM_API_KEY` |
 | **Google Gemini** | `text-embedding-004` (768d) | `gemini-2.0-flash` | Point to Google's OpenAI-compat endpoint or use a gateway |
 | **OpenRouter** | varies | varies | `EMBEDDING_BASE_URL=https://openrouter.ai/api/v1`, `LLM_BASE_URL=https://openrouter.ai/api/v1` |
-| **Local (LM Studio)** | nomic-embed-text-v1.5 (768d) | gemma-4-e4b | `http://127.0.0.1:1234/v1` (default — works out of box) |
+| **Compose default (TEI)** | `sentence-transformers/all-MiniLM-L6-v2` (384d) | from `.env` `LLM_*` | Compose wires `EMBEDDING_BASE_URL=http://embeddings:80/v1` — no host embedder required |
+| **Local (LM Studio)** | e.g. nomic-embed-text-v1.5 (768d) | gemma / local chat model | **Optional override** — point `EMBEDDING_*` / `LLM_*` at `http://127.0.0.1:1234/v1` (host) or `http://host.docker.internal:1234/v1` (in-compose app). Dims must match the loaded embed model (often 768 ≠ compose 384) |
 | **Ollama** | `nomic-embed-text` (768d) | `llama3.2` | `EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1`, `LLM_BASE_URL=http://127.0.0.1:11434/v1` |
 | **Local ONNX** | `all-MiniLM-L6-v2` (384d) | any OpenAI-compat | `EMBEDDING_PROVIDER=local`, LLM still via external endpoint |
 
 ### Container Considerations
 
-The Docker container runs inside Docker networking. By default it connects to
-`host.docker.internal:1234/v1` for both LLM and embeddings. If your provider
-is **external** (OpenAI, Groq, etc.), override in `docker-compose.yml`:
+Compose default: app uses the **TEI embeddings sidecar** (`embeddings:80`) with
+`sentence-transformers/all-MiniLM-L6-v2` at **384-d**. LLM still comes from
+`.env` (`LLM_BASE_URL` / host.docker.internal as needed). To point embeddings at
+an external OpenAI-compat API instead:
 
 ```yaml
 environment:
   EMBEDDING_BASE_URL: https://api.openai.com/v1
+  EMBEDDING_MODEL: text-embedding-3-small
+  EMBEDDING_DIMENSIONS: "1536"
   LLM_BASE_URL: https://api.openai.com/v1
 ```
 
@@ -145,10 +149,12 @@ services:
 |----------|---------|-----------------|
 | `EXTRACTION_EVERY_N_TURNS` | `5` | Run LLM extraction every N user turns |
 | `EXTRACTION_MAX_MEMORIES` | `20` | Max memories extracted per batch |
+| `EXTRACTION_MAX_LAG_SECONDS` | `3600` | L0 newer than last extract beyond this ⇒ recall untrusted (`0` disables) |
 | `PERSONA_EVERY_N_MEMORIES` | `50` | Regenerate persona every N new memories |
 | `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |
 | `RECALL_RRF_K` | `60` | RRF fusion constant (higher = more rank democracy) |
 | `RECALL_SIMILARITY_THRESHOLD` | `0.3` | Minimum vector similarity score |
+| `MEMORY_API_SECRET` | empty | Door: HTTP `X-Memory-Key`. Empty = auth off (local tests) |
 
 ## MCP Server Connection
 
@@ -174,10 +180,17 @@ The MCP server is exposed inside the Docker container. Connect via:
     "memory": {
       "command": "docker",
       "args": ["exec", "-i", "memory-agent-app", "python", "memory_mcp.py"]
+    },
+    "codescratch": {
+      "command": "codescratch",
+      "args": ["mcp"],
+      "env": { "CODESCRATCH_ROOT": "${workspaceFolder}" }
     }
   }
 }
 ```
+
+Root `.mcp.json` also wires **codescratch** (sibling code-graph MCP; index at `<repo>/.codescratch/`). Memory ≠ code graph — never mix the two.
 
 ## Important Notes for Agents
 
@@ -186,7 +199,12 @@ The MCP server is exposed inside the Docker container. Connect via:
 2. **Extraction is batchy** — new conversation turns accumulate in a counter. Only when
    the counter passes `EXTRACTION_EVERY_N_TURNS` does the LLM extract facts. So
    short exchanges may report `memories_added=0` — that's normal.
-3. **Docker networking** — the app container reaches the host via `host.docker.internal`.
-   If you change LLM/embedding URLs, make sure the container can reach them.
-4. **No cloud lock-in** — every component can run fully local (ONNX + local LLM).
+3. **Trust / lag** — short behind-watermark alone stays trusted until cadence is
+   overdue (`extraction_due`) or wall-clock lag exceeds `EXTRACTION_MAX_LAG_SECONDS`
+   (`extraction_lag_exceeded`). Banner fields include `behind_watermark`,
+   `extraction_lag_exceeded`, `extraction_due`. Untrusted empty ≠ “no prefs.”
+4. **Door** — set `MEMORY_API_SECRET`; clients send `X-Memory-Key`. Empty secret = open.
+5. **Docker networking** — embeddings default to compose TEI (`http://embeddings:80/v1`).
+   LLM reaches the host via `host.docker.internal` when configured that way.
+6. **No cloud lock-in** — every component can run fully local (TEI/ONNX + local LLM).
    No telemetry, no external service required.

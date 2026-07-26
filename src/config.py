@@ -38,6 +38,8 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
 EXTRACTION_EVERY_N_TURNS = int(os.getenv("EXTRACTION_EVERY_N_TURNS", "5"))
 EXTRACTION_MAX_MEMORIES = int(os.getenv("EXTRACTION_MAX_MEMORIES", "20"))
+# Wall-clock: L0 newer than last extract + lag over this ⇒ recall untrusted (0 disables).
+EXTRACTION_MAX_LAG_SECONDS = int(os.getenv("EXTRACTION_MAX_LAG_SECONDS", "3600"))
 PERSONA_EVERY_N_MEMORIES = int(os.getenv("PERSONA_EVERY_N_MEMORIES", "50"))
 
 RECALL_STRATEGY = os.getenv("RECALL_STRATEGY", "hybrid")

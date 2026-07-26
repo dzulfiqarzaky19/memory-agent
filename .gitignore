@@ -11,4 +11,4 @@ pgdata/
 .opencode.json/
 .opencode/state/
 .pytest_cache/
-.codestructure/
+.codescratch/

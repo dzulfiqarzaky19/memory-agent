@@ -7,7 +7,7 @@ Local-first, agent-agnostic memory layer for AI agents. PostgreSQL + pgvector ba
 This project is an **MCP-connected memory layer** for AI agents. PostgreSQL + pgvector backend.
 The root `.mcp.json` / `opencode.json` connect **two independent** MCP servers:
 - `memory` — user/session facts (this repo, Docker stdio)
-- `codestructure` — code structure graph for the open workspace (sibling project `D:/dev/projects/codestructure`, no shared state)
+- `codescratch` — code structure graph for the open workspace (sibling project `D:/dev/projects/codescratch`, no shared state)
 
 You do NOT need to understand either internal codebase — use the MCP tools.
 
@@ -61,7 +61,7 @@ HTTP auto-capture: `POST /capture` with `user_id`, `session_key`, `messages`.
 
 Prefer `cs_*` over blind grep for navigation. Memory ≠ code graph — never store code structure into memories or vice versa.
 
-Prerequisite once per machine: `cd D:/dev/projects/codestructure && npm run build`.  
+Prerequisite once per machine: `cd D:/dev/projects/codescratch && npm run build`.  
 First open of a repo: `cs_reindex` with `full=true` or CLI `node dist/cli.js init <repo>`.
 
 ### Key Principles (do not violate)
@@ -156,14 +156,16 @@ All settings in `.env` (single source of truth). Copy `.env` and edit for your s
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgresql://postgres:localdev@localhost:5433/memory_agent` | PostgreSQL |
-| `EMBEDDING_PROVIDER` | `openai` | `openai` (LM Studio) or `local` |
-| `EMBEDDING_MODEL` | `text-embedding-nomic-embed-text-v1.5@q8_0` | Embedding model |
-| `EMBEDDING_DIMENSIONS` | `768` | Embedding vector dimensions |
-| `EMBEDDING_BASE_URL` | `http://127.0.0.1:1234/v1` | Embedding API endpoint |
-| `LLM_PROVIDER` | `openai` | LLM provider for extraction |
-| `LLM_MODEL` | `google/gemma-4-e4b` | LLM for extraction |
-| `LLM_BASE_URL` | `http://127.0.0.1:1234/v1` | LLM API endpoint |
+| `EMBEDDING_PROVIDER` | `openai` | `openai` (OpenAI-compat / TEI) or `local` |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model (compose TEI) |
+| `EMBEDDING_DIMENSIONS` | `384` | Embedding vector dimensions (MiniLM) |
+| `EMBEDDING_BASE_URL` | falls back to `OPENAI_BASE_URL` (`http://127.0.0.1:1234/v1`); compose: `http://embeddings:80/v1` | Embedding API endpoint |
+| `LLM_PROVIDER` | (from `.env`) | LLM provider for extraction |
+| `LLM_MODEL` | (from `.env`) | LLM for extraction |
+| `LLM_BASE_URL` | (from `.env`) | LLM API endpoint |
 | `EXTRACTION_EVERY_N_TURNS` | `5` | Extract every N user turns |
+| `EXTRACTION_MAX_LAG_SECONDS` | `3600` | Wall-clock lag before recall untrusted (`0` off) |
 | `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |
 | `RECALL_RRF_K` | `60` | RRF fusion constant |
 | `RECALL_SIMILARITY_THRESHOLD` | `0.3` | Vector similarity minimum |
+| `MEMORY_API_SECRET` | empty | Door: HTTP `X-Memory-Key`; empty = open |

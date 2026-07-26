@@ -139,18 +139,34 @@ if ($LASTEXITCODE -ne 0) {
 
 # -- 3. Provider picker --
 Write-Host ""
+Write-Host "  Compose default embeddings: TEI MiniLM 384-d (no host embedder)." -ForegroundColor $CYAN
 Write-Host "  Which LLM / embedding provider do you want to use?" -ForegroundColor $CYAN
-Write-Host "    1) Local (LM Studio / Ollama) -- default, works offline"
-Write-Host "    2) OpenAI API"
-Write-Host "    3) Groq"
-Write-Host "    4) Other OpenAI-compatible API"
-Write-Host "    5) Skip -- I will edit .env myself"
-$choice = Read-Host "  Enter 1-5 (default: 1)"
+Write-Host "    1) Compose defaults (TEI MiniLM 384 + LLM from .env / host) -- recommended"
+Write-Host "    2) Local LLM override (LM Studio / Ollama) -- optional; set dims to match embed model"
+Write-Host "    3) OpenAI API"
+Write-Host "    4) Groq"
+Write-Host "    5) Other OpenAI-compatible API"
+Write-Host "    6) Skip -- I will edit .env myself"
+$choice = Read-Host "  Enter 1-6 (default: 1)"
 if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "1" }
+
+$writeEnv = $true
+$apiKey = "not-needed"
+$embUrl = $null
+$llmUrl = $null
+$model = $null
+$embModel = $null
+$embDims = $null
 
 switch ($choice) {
     "1" {
-        info "Configuring for local provider"
+        info "Keeping compose TEI MiniLM 384-d embeddings; only ensure LLM_* if present in .env"
+        $writeEnv = $false
+        info "docker compose overrides EMBEDDING_* to TEI (sentence-transformers/all-MiniLM-L6-v2, 384)."
+        info "Edit .env LLM_BASE_URL / LLM_MODEL for your chat endpoint (host.docker.internal as needed)."
+    }
+    "2" {
+        info "Configuring local LLM/embed override (not compose TEI default)"
         $llmUrl = "http://host.docker.internal:1234/v1"
         $embUrl = "http://host.docker.internal:1234/v1"
         $model = "google/gemma-4-e4b"
@@ -158,7 +174,7 @@ switch ($choice) {
         $embDims = "768"
         $apiKey = "not-needed"
 
-        $localType = Read-Host "  Local type? (1) LM Studio (default) / (2) Ollama"
+        $localType = Read-Host "  Local type? (1) LM Studio / (2) Ollama"
         if ($localType -eq "2") {
             $llmUrl = "http://host.docker.internal:11434/v1"
             $embUrl = "http://host.docker.internal:11434/v1"
@@ -166,8 +182,9 @@ switch ($choice) {
             $embModel = "nomic-embed-text"
             $embDims = "768"
         }
+        warn "Compose still forces TEI unless you override app.environment EMBEDDING_* in docker-compose.override.yml"
     }
-    "2" {
+    "3" {
         info "Configuring for OpenAI"
         $apiKey = Read-Host "  Enter your OpenAI API key (sk-...)"
         $model = Read-Host "  LLM model (default: gpt-4o-mini)"
@@ -179,7 +196,7 @@ switch ($choice) {
         $llmUrl = "https://api.openai.com/v1"
         $embUrl = "https://api.openai.com/v1"
     }
-    "3" {
+    "4" {
         info "Configuring for Groq"
         $apiKey = Read-Host "  Enter your Groq API key (gsk_...)"
         $model = Read-Host "  LLM model (default: llama-3.3-70b-versatile)"
@@ -191,7 +208,7 @@ switch ($choice) {
         $llmUrl = "https://api.groq.com/openai/v1"
         $embUrl = "https://api.groq.com/openai/v1"
     }
-    "4" {
+    "5" {
         info "Configuring custom OpenAI-compatible API"
         $llmUrl = Read-Host "  LLM API base URL (e.g. https://api.openai.com/v1)"
         $embUrl = Read-Host "  Embedding API base URL (same as above or different)"
@@ -201,28 +218,31 @@ switch ($choice) {
         $embDims = Read-Host "  Embedding dimensions"
     }
     default {
+        $writeEnv = $false
         warn "Skipping auto-config -- edit .env manually then re-run"
     }
 }
 
 # -- 4. Write provider settings to .env --
-if ($choice -ne "5") {
+if ($writeEnv -and $choice -ne "6") {
     $envContent = Get-Content ".env" -Raw
 
-    $replacements = @{
-        "OPENAI_API_KEY=not-needed" = "OPENAI_API_KEY=$apiKey"
-        "EMBEDDING_PROVIDER=openai" = "EMBEDDING_PROVIDER=openai"
-        "EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5@q8_0" = "EMBEDDING_MODEL=$embModel"
-        "EMBEDDING_DIMENSIONS=768" = "EMBEDDING_DIMENSIONS=$embDims"
-        "LLM_MODEL=google/gemma-4-e4b" = "LLM_MODEL=$model"
+    # Match either legacy nomic 768 example lines or current MiniLM 384 defaults.
+    $envContent = $envContent -replace "(?m)^EMBEDDING_MODEL=.*$", "EMBEDDING_MODEL=$embModel"
+    $envContent = $envContent -replace "(?m)^EMBEDDING_DIMENSIONS=.*$", "EMBEDDING_DIMENSIONS=$embDims"
+    if ($model) {
+        $envContent = $envContent -replace "(?m)^LLM_MODEL=.*$", "LLM_MODEL=$model"
+    }
+    if ($apiKey -and $apiKey -ne "not-needed") {
+        $envContent = $envContent -replace "(?m)^OPENAI_API_KEY=.*$", "OPENAI_API_KEY=$apiKey"
     }
 
-    $envContent = $envContent -replace "OPENAI_BASE_URL=http://127.0.0.1:1234/v1", ""
-    $envContent = $envContent -replace "(?m)^EMBEDDING_BASE_URL=.*`n?", ""
-    $envContent = $envContent -replace "(?m)^LLM_BASE_URL=.*`n?", ""
-    $envContent = $envContent -replace "(?m)^LLM_API_KEY=.*`n?", ""
+    $envContent = $envContent -replace "(?m)^OPENAI_BASE_URL=.*`r?`n?", ""
+    $envContent = $envContent -replace "(?m)^EMBEDDING_BASE_URL=.*`r?`n?", ""
+    $envContent = $envContent -replace "(?m)^LLM_BASE_URL=.*`r?`n?", ""
+    $envContent = $envContent -replace "(?m)^LLM_API_KEY=.*`r?`n?", ""
 
-    $envContent = $envContent.TrimEnd("`r`n") + @"
+    $envContent = $envContent.TrimEnd("`r", "`n") + @"
 
 # -- Provider URLs (set by setup script) --
 EMBEDDING_BASE_URL=$embUrl
@@ -231,10 +251,6 @@ LLM_BASE_URL=$llmUrl
 
     if ($apiKey -ne "not-needed" -and $apiKey -ne "") {
         $envContent = $envContent + "`r`nLLM_API_KEY=$apiKey"
-    }
-
-    foreach ($k in $replacements.Keys) {
-        $envContent = $envContent -replace [regex]::Escape($k), $replacements[$k]
     }
 
     Set-Content ".env" -Value $envContent -NoNewline

@@ -12,7 +12,8 @@ import asyncpg
 async def main():
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute(
-        "TRUNCATE conversations, memories, scenarios, extraction_state, personas"
+        """TRUNCATE conversations, memories, scenarios, extraction_state,
+                  personas, capture_checkpoints"""
     )
     await conn.close()
     print("All data wiped.")

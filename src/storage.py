@@ -171,7 +171,8 @@ class Storage:
             if current == dims:
                 continue
             logger.warning(
-                "Rebuilding %s.embedding: %s-d -> %s-d (vector rows cleared)",
+                "Rebuilding %s.embedding: %s-d -> %s-d "
+                "(vector column wiped; L1/L2 text kept but unsearchable until re-embed)",
                 table,
                 current,
                 dims,
@@ -182,6 +183,19 @@ class Storage:
             await conn.execute(
                 f"ALTER TABLE {table} ADD COLUMN embedding vector({dims})"
             )
+            # Flag rows so ops/tools can detect amnesia after dim change.
+            if table == "memories":
+                await conn.execute(
+                    """UPDATE memories
+                       SET metadata = COALESCE(metadata, '{}'::jsonb)
+                           || '{"_embed_stale": true}'::jsonb"""
+                )
+            else:
+                await conn.execute(
+                    """UPDATE scenarios
+                       SET metadata = COALESCE(metadata, '{}'::jsonb)
+                           || '{"_embed_stale": true}'::jsonb"""
+                )
         # Recreate HNSW indexes if missing after rebuild
         await conn.execute(
             """
@@ -293,25 +307,47 @@ class Storage:
         user_id: str,
         since: Optional[datetime] = None,
         limit: int = 200,
+        after_id: Optional[str] = None,
     ) -> list[dict]:
+        """L0 rows after the extraction cursor, oldest-first.
+
+        Keyset on (created_at, id) so rows sharing a timestamp are not orphaned
+        when the watermark advances to max(created_at) of a limited window.
+        """
         async with self._pool.acquire() as conn:
             if since is None:
+                # Cold start: mine oldest-first so early L0 is not dropped after success mark.
                 rows = await conn.fetch(
                     """SELECT id, role, content, metadata, created_at
                        FROM conversations
                        WHERE user_id = $1
-                       ORDER BY created_at DESC
+                       ORDER BY created_at ASC, id ASC
                        LIMIT $2""",
                     user_id,
                     limit,
                 )
-                rows = list(reversed(rows))
+            elif after_id is not None:
+                rows = await conn.fetch(
+                    """SELECT id, role, content, metadata, created_at
+                       FROM conversations
+                       WHERE user_id = $1
+                         AND (
+                           created_at > $2
+                           OR (created_at = $2 AND id > $3)
+                         )
+                       ORDER BY created_at ASC, id ASC
+                       LIMIT $4""",
+                    user_id,
+                    since,
+                    after_id,
+                    limit,
+                )
             else:
                 rows = await conn.fetch(
                     """SELECT id, role, content, metadata, created_at
                        FROM conversations
                        WHERE user_id = $1 AND created_at > $2
-                       ORDER BY created_at ASC
+                       ORDER BY created_at ASC, id ASC
                        LIMIT $3""",
                     user_id,
                     since,
@@ -340,6 +376,10 @@ class Storage:
         agent_id: Optional[str] = None,
         metadata: Optional[dict] = None,
     ) -> Optional[str]:
+        if len(embedding) != EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"embedding dim {len(embedding)} != EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}"
+            )
         text_hash = hashlib.md5(text.encode()).hexdigest()
         if await self.check_duplicate(user_id, text):
             return None
@@ -573,6 +613,10 @@ class Storage:
         memory_ids: list[str],
         metadata: Optional[dict] = None,
     ) -> str:
+        if len(embedding) != EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"embedding dim {len(embedding)} != EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}"
+            )
         row_id = str(uuid4())
         async with self._pool.acquire() as conn:
             await conn.execute(
@@ -643,16 +687,27 @@ class Storage:
             for r in rows
         ]
 
-    async def get_memories_by_ids(self, ids: list[str]) -> list[dict]:
+    async def get_memories_by_ids(
+        self, ids: list[str], user_id: Optional[str] = None
+    ) -> list[dict]:
         if not ids:
             return []
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT id, text, mem_type, priority, metadata, created_at
-                   FROM memories
-                   WHERE id = ANY($1::text[])""",
-                ids,
-            )
+            if user_id is None:
+                rows = await conn.fetch(
+                    """SELECT id, text, mem_type, priority, metadata, created_at
+                       FROM memories
+                       WHERE id = ANY($1::text[])""",
+                    ids,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, text, mem_type, priority, metadata, created_at
+                       FROM memories
+                       WHERE user_id = $1 AND id = ANY($2::text[])""",
+                    user_id,
+                    ids,
+                )
         return [
             {
                 "id": r["id"],
@@ -679,6 +734,12 @@ class Storage:
 
     async def replace_scenarios(self, user_id: str, scenarios: list[dict]) -> None:
         """Legacy full wipe — prefer upsert_scenarios_by_name."""
+        for s in scenarios:
+            emb = s.get("embedding") or []
+            if len(emb) != EMBEDDING_DIMENSIONS:
+                raise ValueError(
+                    f"embedding dim {len(emb)} != EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}"
+                )
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM scenarios WHERE user_id = $1", user_id)
@@ -700,6 +761,12 @@ class Storage:
         """Merge scenarios by case-insensitive name. Never deletes siblings."""
         if not scenarios:
             return 0
+        for s in scenarios:
+            emb = s.get("embedding") or []
+            if len(emb) != EMBEDDING_DIMENSIONS:
+                raise ValueError(
+                    f"embedding dim {len(emb)} != EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}"
+                )
         touched = 0
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -800,22 +867,38 @@ class Storage:
                 "SELECT COUNT(*) FROM conversations WHERE user_id = $1", user_id
             )
 
-    async def mark_extraction_success(self, user_id: str) -> None:
-        """Cadence complete: clear counter and advance extraction watermark."""
+    async def latest_conversation_at(self, user_id: str) -> Optional[datetime]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT MAX(created_at) FROM conversations WHERE user_id = $1",
+                user_id,
+            )
+
+    async def mark_extraction_success(
+        self,
+        user_id: str,
+        watermark_at: Optional[datetime] = None,
+    ) -> None:
+        """Cadence complete: clear counter and advance extraction watermark.
+
+        watermark_at must be the newest L0 row *included* in the mined window
+        (not wall-clock now) so concurrent L0 during LLM work is not skipped.
+        """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO extraction_state
                        (user_id, conversations_seen, last_extraction_at,
                         last_extract_ok, last_extract_error, last_extract_attempt_at, updated_at)
-                   VALUES ($1, 0, now(), true, NULL, now(), now())
+                   VALUES ($1, 0, COALESCE($2, now()), true, NULL, now(), now())
                    ON CONFLICT (user_id) DO UPDATE SET
                        conversations_seen = 0,
-                       last_extraction_at = now(),
+                       last_extraction_at = COALESCE($2, now()),
                        last_extract_ok = true,
                        last_extract_error = NULL,
                        last_extract_attempt_at = now(),
                        updated_at = now()""",
                 user_id,
+                watermark_at,
             )
 
     async def mark_extraction_failure(self, user_id: str, error: str) -> None:
@@ -903,9 +986,13 @@ class Storage:
             await conn.execute("DELETE FROM scenarios WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM extraction_state WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM personas WHERE user_id = $1", user_id)
+            await conn.execute(
+                "DELETE FROM capture_checkpoints WHERE user_id = $1", user_id
+            )
 
     async def wipe_all(self) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "TRUNCATE conversations, memories, scenarios, extraction_state, personas"
+                """TRUNCATE conversations, memories, scenarios, extraction_state,
+                          personas, capture_checkpoints"""
             )

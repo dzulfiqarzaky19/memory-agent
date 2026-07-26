@@ -219,14 +219,11 @@ MEMORIES:
 
 Persona:"""
 
-        try:
-            return await self._call_llm(
-                system="You are a persona synthesis engine. Generate a concise, accurate user profile from extracted memories.",
-                user=prompt,
-            )
-        except Exception as e:
-            logger.error(f"Persona generation failed: {e}")
-            return "No persona available yet."
+        # Raise on failure — caller must not cache error strings as persona.
+        return await self._call_llm(
+            system="You are a persona synthesis engine. Generate a concise, accurate user profile from extracted memories.",
+            user=prompt,
+        )
 
     async def _call_llm(self, system: str, user: str) -> str:
         self._require_llm()

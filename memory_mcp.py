@@ -4,9 +4,17 @@ Run: python memory_mcp.py
 Connect via opencode.json as stdio MCP server.
 """
 import os
+import sys
+from pathlib import Path
 
 import httpx
 from mcp.server import FastMCP
+
+# Prefer package path used in Docker (PYTHONPATH=/app/src); fall back to repo layout.
+_SRC = Path(__file__).resolve().parent / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+from ids import canonicalize_user_id  # noqa: E402
 
 MCP = FastMCP("memory-agent")
 API_BASE = (os.getenv("MEMORY_AGENT_URL") or "http://127.0.0.1:8000").rstrip("/")
@@ -19,13 +27,6 @@ def _headers() -> dict[str, str]:
     return {"X-Memory-Key": _API_SECRET}
 
 
-def _canon_user(user_id: str) -> str:
-    uid = (user_id or "").strip().lower()
-    if not uid:
-        raise ValueError("user_id must be non-empty")
-    return uid
-
-
 def _trust_banner(trust: dict | None) -> str:
     if not trust:
         return ""
@@ -34,6 +35,9 @@ def _trust_banner(trust: dict | None) -> str:
     return (
         f"[trust user={trust.get('user_id')} l0={trust.get('l0_count')} l1={trust.get('l1_count')} "
         f"extract_ok={ok_s} pending={trust.get('conversations_seen')} "
+        f"behind_watermark={trust.get('behind_watermark')} "
+        f"extraction_lag_exceeded={trust.get('extraction_lag_exceeded')} "
+        f"extraction_due={trust.get('extraction_due')} "
         f"recall_trusted={trust.get('recall_trusted')}]"
     )
 
@@ -41,7 +45,7 @@ def _trust_banner(trust: dict | None) -> str:
 @MCP.tool()
 async def search_memories(user_id: str, query: str) -> str:
     """Recall relevant memories before responding to the user."""
-    uid = _canon_user(user_id)
+    uid = canonicalize_user_id(user_id)
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.post(
             f"{API_BASE}/search",
@@ -70,7 +74,7 @@ async def store_memories(user_id: str, messages: str) -> str:
 
     Pass messages as alternating 'user: ...' and 'assistant: ...' lines.
     """
-    uid = _canon_user(user_id)
+    uid = canonicalize_user_id(user_id)
     lines = [l.strip() for l in messages.strip().split("\n") if l.strip()]
     parsed = []
     for line in lines:
@@ -99,7 +103,7 @@ async def store_memories(user_id: str, messages: str) -> str:
 @MCP.tool()
 async def get_persona(user_id: str) -> str:
     """Get the user's persona summary."""
-    uid = _canon_user(user_id)
+    uid = canonicalize_user_id(user_id)
     async with httpx.AsyncClient(timeout=120) as c:
         r = await c.get(f"{API_BASE}/persona/{uid}", headers=_headers())
         r.raise_for_status()

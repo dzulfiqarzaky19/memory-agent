@@ -129,18 +129,34 @@ fi
 
 # ── 3. Provider picker ──────────────────────────
 echo ""
+echo -e "  ${CYAN}Compose default embeddings: TEI MiniLM 384-d (no host embedder).${NC}"
 echo -e "  ${CYAN}Which LLM / embedding provider do you want to use?${NC}"
-echo "    1) Local (LM Studio / Ollama) -- default, works offline"
-echo "    2) OpenAI API"
-echo "    3) Groq"
-echo "    4) Other OpenAI-compatible API"
-echo "    5) Skip -- I will edit .env myself"
-read -r -p "  Enter 1-5 (default: 1): " choice
+echo "    1) Compose defaults (TEI MiniLM 384 + LLM from .env / host) -- recommended"
+echo "    2) Local LLM override (LM Studio / Ollama) -- optional; set dims to match embed model"
+echo "    3) OpenAI API"
+echo "    4) Groq"
+echo "    5) Other OpenAI-compatible API"
+echo "    6) Skip -- I will edit .env myself"
+read -r -p "  Enter 1-6 (default: 1): " choice
 choice="${choice:-1}"
+
+write_env=1
+api_key="not-needed"
+llm_url=""
+emb_url=""
+model=""
+emb_model=""
+emb_dims=""
 
 case "$choice" in
   1)
-    info "Configuring for local provider"
+    info "Keeping compose TEI MiniLM 384-d embeddings; only ensure LLM_* if present in .env"
+    write_env=0
+    info "docker compose overrides EMBEDDING_* to TEI (sentence-transformers/all-MiniLM-L6-v2, 384)."
+    info "Edit .env LLM_BASE_URL / LLM_MODEL for your chat endpoint (host.docker.internal as needed)."
+    ;;
+  2)
+    info "Configuring local LLM/embed override (not compose TEI default)"
     llm_url="http://host.docker.internal:1234/v1"
     emb_url="http://host.docker.internal:1234/v1"
     model="google/gemma-4-e4b"
@@ -148,7 +164,7 @@ case "$choice" in
     emb_dims="768"
     api_key="not-needed"
 
-    read -r -p "  Local type? (1) LM Studio (default) / (2) Ollama: " local_type
+    read -r -p "  Local type? (1) LM Studio / (2) Ollama: " local_type
     if [ "$local_type" = "2" ]; then
       llm_url="http://host.docker.internal:11434/v1"
       emb_url="http://host.docker.internal:11434/v1"
@@ -156,8 +172,9 @@ case "$choice" in
       emb_model="nomic-embed-text"
       emb_dims="768"
     fi
+    warn "Compose still forces TEI unless you override app.environment EMBEDDING_* in docker-compose.override.yml"
     ;;
-  2)
+  3)
     info "Configuring for OpenAI"
     read -r -p "  Enter your OpenAI API key (sk-...): " api_key
     read -r -p "  LLM model (default: gpt-4o-mini): " model
@@ -169,7 +186,7 @@ case "$choice" in
     llm_url="https://api.openai.com/v1"
     emb_url="https://api.openai.com/v1"
     ;;
-  3)
+  4)
     info "Configuring for Groq"
     read -r -p "  Enter your Groq API key (gsk_...): " api_key
     read -r -p "  LLM model (default: llama-3.3-70b-versatile): " model
@@ -181,7 +198,7 @@ case "$choice" in
     llm_url="https://api.groq.com/openai/v1"
     emb_url="https://api.groq.com/openai/v1"
     ;;
-  4)
+  5)
     info "Configuring custom OpenAI-compatible API"
     read -r -p "  LLM API base URL (e.g. https://api.openai.com/v1): " llm_url
     read -r -p "  Embedding API base URL: " emb_url
@@ -191,23 +208,28 @@ case "$choice" in
     read -r -p "  Embedding dimensions: " emb_dims
     ;;
   *)
+    write_env=0
     warn "Skipping auto-config — edit .env manually then re-run"
     ;;
 esac
 
 # ── 4. Write provider settings to .env ──────────
-if [ "$choice" != "5" ]; then
+if [ "$write_env" -eq 1 ] && [ "$choice" != "6" ]; then
   # Remove old OPENAI_BASE_URL, EMBEDDING_BASE_URL, LLM_BASE_URL, LLM_API_KEY
   sed -i '/^OPENAI_BASE_URL=/d' .env
   sed -i '/^EMBEDDING_BASE_URL=/d' .env
   sed -i '/^LLM_BASE_URL=/d' .env
   sed -i '/^LLM_API_KEY=/d' .env
 
-  # Update key-value pairs
-  sed -i "s|^OPENAI_API_KEY=not-needed|OPENAI_API_KEY=$api_key|" .env
-  sed -i "s|^EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5@q8_0|EMBEDDING_MODEL=$emb_model|" .env
-  sed -i "s|^EMBEDDING_DIMENSIONS=768|EMBEDDING_DIMENSIONS=$emb_dims|" .env
-  sed -i "s|^LLM_MODEL=google/gemma-4-e4b|LLM_MODEL=$model|" .env
+  # Match either legacy nomic 768 example lines or current MiniLM 384 defaults.
+  if [ -n "$api_key" ] && [ "$api_key" != "not-needed" ]; then
+    sed -i "s|^OPENAI_API_KEY=.*|OPENAI_API_KEY=$api_key|" .env
+  fi
+  sed -i "s|^EMBEDDING_MODEL=.*|EMBEDDING_MODEL=$emb_model|" .env
+  sed -i "s|^EMBEDDING_DIMENSIONS=.*|EMBEDDING_DIMENSIONS=$emb_dims|" .env
+  if [ -n "$model" ]; then
+    sed -i "s|^LLM_MODEL=.*|LLM_MODEL=$model|" .env
+  fi
 
   # Append provider URLs
   cat >> .env << EOF

@@ -4,12 +4,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from config import EMBEDDING_DIMENSIONS
+
 
 @pytest.mark.asyncio
 async def test_save_and_search_memories(db):
     uid = "test-user-storage"
 
-    embedding = [0.1] * 768
+    embedding = [0.1] * EMBEDDING_DIMENSIONS
     mid = await db.save_memory(uid, "User likes Python", embedding)
     assert mid is not None
     assert isinstance(mid, str)
@@ -25,7 +27,7 @@ async def test_save_and_search_memories(db):
 @pytest.mark.asyncio
 async def test_dedup_memories(db):
     uid = "test-dedup"
-    embedding = [0.1] * 768
+    embedding = [0.1] * EMBEDDING_DIMENSIONS
 
     mid1 = await db.save_memory(uid, "User likes Go", embedding)
     assert mid1 is not None
@@ -39,7 +41,7 @@ async def test_dedup_memories(db):
 @pytest.mark.asyncio
 async def test_unique_user_text_hash(db):
     uid = "test-unique-hash"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
     text = "Unique constraint fact"
 
     mid1 = await db.save_memory(uid, text, emb)
@@ -93,13 +95,14 @@ async def test_conversations_since(db):
     assert "new reply" in texts
 
     cold = await db.get_conversations_since(uid, since=None, limit=10)
-    assert any(c["content"] == "old message" for c in cold)
+    assert cold[0]["content"] == "old message"
+    assert [c["created_at"] for c in cold] == sorted(c["created_at"] for c in cold)
 
 
 @pytest.mark.asyncio
 async def test_keyword_search(db):
     uid = "test-keyword"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
 
     await db.save_memory(uid, "User enjoys hiking in mountains", emb)
     await db.save_memory(uid, "User likes programming in Rust", emb)
@@ -112,7 +115,7 @@ async def test_keyword_search(db):
 @pytest.mark.asyncio
 async def test_hybrid_search(db):
     uid = "test-hybrid"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
 
     await db.save_memory(uid, "User builds web apps with React", emb)
     await db.save_memory(uid, "User uses PostgreSQL for databases", emb)
@@ -133,7 +136,7 @@ async def test_hybrid_search(db):
 @pytest.mark.asyncio
 async def test_hybrid_rrf_score_is_fused(db):
     uid = "test-rrf-fused"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
     rrf_k = 60
 
     # Identical embeddings → both share vector ranks; keyword differentiates.
@@ -166,7 +169,7 @@ async def test_hybrid_rrf_score_is_fused(db):
 @pytest.mark.asyncio
 async def test_scenario_crud(db):
     uid = "test-scenario"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
 
     sid = await db.save_scenario(uid, "Dev Tools", "User's dev preferences", emb, ["mem1", "mem2"])
     assert sid is not None
@@ -182,7 +185,7 @@ async def test_scenario_crud(db):
 @pytest.mark.asyncio
 async def test_replace_scenarios_atomic(db):
     uid = "test-replace-scen"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
 
     await db.save_scenario(uid, "Old A", "desc a", emb, ["m1"])
     await db.save_scenario(uid, "Old B", "desc b", emb, ["m2"])
@@ -207,7 +210,7 @@ async def test_replace_scenarios_atomic(db):
 @pytest.mark.asyncio
 async def test_typed_memory_and_instructions(db):
     uid = "test-typed"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
 
     await db.save_memory(uid, "Always answer in English", emb, mem_type="instruction", priority=90)
     await db.save_memory(uid, "User likes hiking", emb, mem_type="persona", priority=70)
@@ -225,7 +228,7 @@ async def test_typed_memory_and_instructions(db):
 @pytest.mark.asyncio
 async def test_agent_scoping(db):
     uid = "test-agent-scope"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
 
     await db.save_memory(uid, "Shared user fact", emb)  # agent_id NULL -> global
     await db.save_memory(uid, "Agent-A only fact", emb, agent_id="agent-a")
@@ -240,9 +243,76 @@ async def test_agent_scoping(db):
 @pytest.mark.asyncio
 async def test_count_memories(db):
     uid = "test-count"
-    emb = [0.1] * 768
+    emb = [0.1] * EMBEDDING_DIMENSIONS
 
     assert await db.count_memories(uid) == 0
     await db.save_memory(uid, "test memory", emb)
     assert await db.count_memories(uid) == 1
     assert await db.count_memories() >= 1
+
+
+@pytest.mark.asyncio
+async def test_save_memory_rejects_wrong_dim(db):
+    uid = "test-save-dim"
+    with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+        await db.save_memory(uid, "bad dim", [0.1] * 3)
+
+
+@pytest.mark.asyncio
+async def test_upsert_scenarios_rejects_wrong_dim(db):
+    uid = "test-upsert-dim"
+    with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+        await db.upsert_scenarios_by_name(
+            uid,
+            [
+                {
+                    "name": "Bad",
+                    "description": "wrong width",
+                    "embedding": [0.1] * 3,
+                    "memory_ids": ["m1"],
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_cold_conversations_oldest_first(db):
+    uid = "test-cold-asc"
+    await db.save_conversation(uid, "user", "first")
+    await db.save_conversation(uid, "user", "second")
+    await db.save_conversation(uid, "user", "third")
+    cold = await db.get_conversations_since(uid, since=None, limit=2)
+    assert [c["content"] for c in cold] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_mark_extraction_success_watermark_not_now(db):
+    uid = "test-wm-not-now"
+    await db.save_conversation(uid, "user", "old")
+    await db.save_conversation(uid, "user", "mid")
+    await db.save_conversation(uid, "user", "new")
+    window = await db.get_conversations_since(uid, since=None, limit=2)
+    assert [c["content"] for c in window] == ["old", "mid"]
+    wm = max(c["created_at"] for c in window)
+    await db.mark_extraction_success(uid, watermark_at=wm)
+    state = await db.get_extraction_state(uid)
+    assert state["last_extraction_at"] == wm
+    rest = await db.get_conversations_since(uid, since=state["last_extraction_at"])
+    assert [c["content"] for c in rest] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_replace_scenarios_rejects_wrong_dim(db):
+    uid = "test-replace-dim"
+    with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+        await db.replace_scenarios(
+            uid,
+            [
+                {
+                    "name": "Bad",
+                    "description": "wrong width",
+                    "embedding": [0.1] * 3,
+                    "memory_ids": ["m1"],
+                }
+            ],
+        )

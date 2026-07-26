@@ -8,7 +8,12 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from config import MEMORY_ALLOW_RELOAD, MEMORY_API_SECRET, MEMORY_BIND_HOST
+from config import (
+    EMBEDDING_DIMENSIONS,
+    MEMORY_ALLOW_RELOAD,
+    MEMORY_API_SECRET,
+    MEMORY_BIND_HOST,
+)
 from embeddings import create_embedding_provider
 from extraction import LLMExtractor
 from memory import MemoryEngine
@@ -45,6 +50,9 @@ def _secret_ok(provided: str | None) -> bool:
     if not expected:
         return True
     got = provided or ""
+    # compare_digest raises on length mismatch — never 500 on bad keys.
+    if len(got) != len(expected):
+        return False
     return hmac.compare_digest(got, expected)
 
 
@@ -79,10 +87,23 @@ async def lifespan(app: FastAPI):
     global engine
     await storage.initialize()
     embedder = create_embedding_provider()
+    if embedder.dimensions != EMBEDDING_DIMENSIONS:
+        raise RuntimeError(
+            f"embedder.dimensions={embedder.dimensions} != EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}"
+        )
+    probe = embedder.embed(["dim-check"])
+    if not probe or len(probe[0]) != EMBEDDING_DIMENSIONS:
+        got = len(probe[0]) if probe else 0
+        raise RuntimeError(
+            f"live embed dim-check failed: got {got}, expected EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}"
+        )
     extractor = LLMExtractor()
     engine = MemoryEngine(storage=storage, embedder=embedder, extractor=extractor)
     if MEMORY_API_SECRET:
-        logger.info("Memory agent started (API key required)")
+        logger.info(
+            "Memory agent started (API key required, embed_dims=%s)",
+            EMBEDDING_DIMENSIONS,
+        )
     else:
         logger.warning(
             "Memory agent started with MEMORY_API_SECRET unset — HTTP routes open on bind host"

@@ -6,12 +6,12 @@
       "command": ["docker", "exec", "-i", "memory-agent-app", "python", "memory_mcp.py"],
       "enabled": true
     },
-    "codestructure": {
+    "codescratch": {
       "type": "local",
-      "command": ["node", "D:/dev/projects/codestructure/dist/mcp.js"],
+      "command": ["codescratch", "mcp"],
       "enabled": true,
       "environment": {
-        "CODESTRUCTURE_ROOT": "${workspaceFolder}"
+        "CODESCRATCH_ROOT": "${workspaceFolder}"
       }
     }
   }

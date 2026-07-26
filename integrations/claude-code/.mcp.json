@@ -4,11 +4,11 @@
       "command": "docker",
       "args": ["exec", "-i", "memory-agent-app", "python", "memory_mcp.py"]
     },
-    "codestructure": {
-      "command": "node",
-      "args": ["D:/dev/projects/codestructure/dist/mcp.js"],
+    "codescratch": {
+      "command": "codescratch",
+      "args": ["mcp"],
       "env": {
-        "CODESTRUCTURE_ROOT": "${workspaceFolder}"
+        "CODESCRATCH_ROOT": "${workspaceFolder}"
       }
     }
   }

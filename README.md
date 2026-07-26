@@ -144,10 +144,10 @@ LLM_MODEL=google/gemma-4-e4b
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgresql://postgres:localdev@localhost:5433/memory_agent` | PostgreSQL |
-| `EMBEDDING_PROVIDER` | `openai` | `openai` (LM Studio) or `local` |
-| `EMBEDDING_MODEL` | `text-embedding-nomic-embed-text-v1.5@q8_0` | Embedding model |
-| `EMBEDDING_DIMENSIONS` | `768` | Embedding vector dimensions |
-| `EMBEDDING_BASE_URL` | `http://127.0.0.1:1234/v1` | Embedding API endpoint |
+| `EMBEDDING_PROVIDER` | `openai` | `openai` (TEI / OpenAI-compatible) or `local` |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model (compose TEI default) |
+| `EMBEDDING_DIMENSIONS` | `384` | Must match model + pgvector column width |
+| `EMBEDDING_BASE_URL` | compose: `http://embeddings:80/v1` | Embedding API endpoint |
 | `LLM_PROVIDER` | `openai` | LLM provider for extraction |
 | `LLM_MODEL` | `google/gemma-4-e4b` | LLM for extraction |
 | `LLM_BASE_URL` | `http://127.0.0.1:1234/v1` | LLM API endpoint |
@@ -155,6 +155,7 @@ LLM_MODEL=google/gemma-4-e4b
 | `LLM_MAX_TOKENS` | `4096` | Max tokens for LLM calls |
 | `EXTRACTION_EVERY_N_TURNS` | `5` | Extract every N user turns |
 | `EXTRACTION_MAX_MEMORIES` | `20` | Max memories per extraction |
+| `EXTRACTION_MAX_LAG_SECONDS` | `3600` | L0 newer than last extract + lag over this ⇒ `recall_trusted=false` (`0` disables) |
 | `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |
 | `RECALL_RRF_K` | `60` | RRF fusion constant |
 | `RECALL_SIMILARITY_THRESHOLD` | `0.3` | Vector similarity minimum |

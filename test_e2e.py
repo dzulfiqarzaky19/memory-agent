@@ -40,7 +40,8 @@ async def main():
     print(f"   memories_added: {j['memories_added']}")
     print(f"   0 = expected (not enough turns yet)")
 
-    print("\n3. Store 4 more messages (triggers extraction)")
+    # Default EXTRACTION_EVERY_N_TURNS=5. Step 2 was 1 user turn; need 4 more.
+    print("\n3. Store until extraction threshold (default every 5 user turns)")
     r = CLIENT.post(f"{BASE}/add", json={
         "user_id": TEST_USER,
         "messages": [
@@ -48,10 +49,14 @@ async def main():
             {"role": "assistant", "content": "Great tech stack!"},
             {"role": "user", "content": "I prefer dark mode in VS Code"},
             {"role": "assistant", "content": "Good choice, easy on the eyes"},
+            {"role": "user", "content": "My name is E2E Tester"},
+            {"role": "assistant", "content": "Noted"},
+            {"role": "user", "content": "I work mostly on Windows"},
+            {"role": "assistant", "content": "Got it"},
         ],
     })
     j = r.json()
-    print(f"   memories_added: {j['memories_added']}")
+    print(f"   memories_added: {j['memories_added']} extract_status={j.get('extract_status')}")
 
     print("\n4. Search for memories")
     r = CLIENT.post(f"{BASE}/search", json={

@@ -75,11 +75,13 @@ class MemoryTrust(BaseModel):
     conversations_seen: int = 0
     extraction_pending: bool = False
     extraction_due: bool = False
+    behind_watermark: bool = False
     last_extract_ok: Optional[bool] = None
     last_extract_error: Optional[str] = None
     last_extraction_at: Optional[datetime] = None
     last_extract_attempt_at: Optional[datetime] = None
     extraction_lag_seconds: Optional[float] = None
+    extraction_lag_exceeded: bool = False
     recall_trusted: bool = False
 
 

@@ -7,6 +7,7 @@ from typing import Optional
 
 from config import (
     EXTRACTION_EVERY_N_TURNS,
+    EXTRACTION_MAX_LAG_SECONDS,
     PERSONA_EVERY_N_MEMORIES,
     RECALL_MAX_RESULTS,
     RECALL_RRF_K,
@@ -47,6 +48,12 @@ def _lag_seconds(ts) -> Optional[float]:
     return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
 
+def _aware(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
 class MemoryEngine:
     def __init__(self, storage: Storage, embedder: EmbeddingProvider, extractor: LLMExtractor):
         self.storage = storage
@@ -54,30 +61,53 @@ class MemoryEngine:
         self.extractor = extractor
 
     async def memory_trust(self, user_id: str) -> dict:
+        """Recall is trusted only when extraction is caught up — not merely 'has any L1'."""
         uid = canonicalize_user_id(user_id)
         state = await self.storage.get_extraction_state(uid) or {}
         l0 = await self.storage.count_conversations(uid)
         l1 = await self.storage.count_memories(uid)
         seen = int(state.get("conversations_seen") or 0)
         last_ok = state.get("last_extract_ok")
+        last_at = state.get("last_extraction_at")
+        latest_l0 = await self.storage.latest_conversation_at(uid)
+        lag = _lag_seconds(last_at)
+
         overdue = seen >= EXTRACTION_EVERY_N_TURNS
-        # Trusted when last extract succeeded, or L1 already has atoms and no hard failure.
-        has_l1 = l1 > 0
-        trusted = (not overdue) and (
-            last_ok is True or (last_ok is not False and has_l1)
+        never_extracted = l0 > 0 and last_at is None
+        behind_watermark = False
+        if last_at is not None and latest_l0 is not None:
+            behind_watermark = _aware(latest_l0) > _aware(last_at)
+        lag_exceeded = (
+            behind_watermark
+            and lag is not None
+            and EXTRACTION_MAX_LAG_SECONDS > 0
+            and lag > EXTRACTION_MAX_LAG_SECONDS
         )
+        # Empty diary is honestly empty. Otherwise need a successful extract and no lag breach.
+        if l0 == 0 and l1 == 0:
+            trusted = last_ok is not False
+        else:
+            trusted = (
+                last_ok is True
+                and not overdue
+                and not never_extracted
+                and not lag_exceeded
+            )
+        pending = seen > 0 or behind_watermark or never_extracted
         return {
             "user_id": uid,
             "l0_count": l0,
             "l1_count": l1,
             "conversations_seen": seen,
-            "extraction_pending": seen > 0,
+            "extraction_pending": pending,
             "extraction_due": overdue,
+            "behind_watermark": behind_watermark or never_extracted,
             "last_extract_ok": last_ok,
             "last_extract_error": state.get("last_extract_error"),
-            "last_extraction_at": state.get("last_extraction_at"),
+            "last_extraction_at": last_at,
             "last_extract_attempt_at": state.get("last_extract_attempt_at"),
-            "extraction_lag_seconds": _lag_seconds(state.get("last_extraction_at")),
+            "extraction_lag_seconds": lag,
+            "extraction_lag_exceeded": lag_exceeded,
             "recall_trusted": bool(trusted),
         }
 
@@ -109,34 +139,59 @@ class MemoryEngine:
             last_extraction_at = state["last_extraction_at"]
 
             if conversations_seen >= EXTRACTION_EVERY_N_TURNS:
+                # Page through pending L0 until empty. Watermark = last mined
+                # created_at (not now()); keyset (created_at, id) drains ties.
                 cold_limit = max(EXTRACTION_EVERY_N_TURNS * 4, 40)
-                pending = await self.storage.get_conversations_since(
-                    uid,
-                    since=last_extraction_at,
-                    limit=cold_limit if last_extraction_at is None else 200,
-                )
-                if not pending:
-                    # Nothing to mine — advance cadence so we don't spin.
-                    await self.storage.mark_extraction_success(uid)
-                    extract_status = "empty_window"
-                else:
-                    try:
+                window_limit = cold_limit if last_extraction_at is None else 200
+                cursor_at = last_extraction_at
+                cursor_id: Optional[str] = None
+                try:
+                    mined_any = False
+                    while True:
+                        pending = await self.storage.get_conversations_since(
+                            uid,
+                            since=cursor_at,
+                            limit=window_limit,
+                            after_id=cursor_id,
+                        )
+                        if not pending:
+                            if not mined_any:
+                                await self.storage.mark_extraction_success(uid)
+                                extract_status = "empty_window"
+                            break
+
                         extracted = await self._extract_and_store(uid, pending, agent_id)
-                        memories_added = len(extracted)
-                        memory_ids = [m["id"] for m in extracted] if extracted else []
-                        await self.storage.mark_extraction_success(uid)
+                        batch_n = len(extracted)
+                        memories_added += batch_n
+                        if extracted:
+                            memory_ids.extend(m["id"] for m in extracted)
+
+                        last_row = pending[-1]
+                        watermark = last_row["created_at"]
+                        await self.storage.mark_extraction_success(
+                            uid, watermark_at=watermark
+                        )
+                        cursor_at = watermark
+                        cursor_id = last_row["id"]
+                        mined_any = True
                         extract_status = "ok" if memories_added else "ok_no_facts"
-                        if memories_added:
-                            memories_since_scenario = await self.storage.bump_scenario_counter(
-                                uid, memories_added
-                            )
-                            if memories_since_scenario >= SCENARIO_REBUILD_INTERVAL:
-                                await self._rebuild_scenarios(uid)
-                                await self.storage.reset_scenario_counter(uid)
-                    except Exception as e:
-                        logger.error("Extraction failed for %s: %s", uid, e)
-                        await self.storage.mark_extraction_failure(uid, str(e))
-                        extract_status = "failed"
+
+                        got = len(pending)
+                        if got < window_limit:
+                            break
+                        window_limit = 200
+
+                    if memories_added:
+                        memories_since_scenario = await self.storage.bump_scenario_counter(
+                            uid, memories_added
+                        )
+                        if memories_since_scenario >= SCENARIO_REBUILD_INTERVAL:
+                            await self._rebuild_scenarios(uid)
+                            await self.storage.reset_scenario_counter(uid)
+                except Exception as e:
+                    logger.error("Extraction failed for %s: %s", uid, e)
+                    await self.storage.mark_extraction_failure(uid, str(e))
+                    extract_status = "failed"
 
         return {
             "memories_added": memories_added,
@@ -174,6 +229,9 @@ class MemoryEngine:
 
         batch = _batch_hash(cleaned)
         cp = await self.storage.get_capture_checkpoint(session_key)
+        if cp and cp.get("user_id") and cp["user_id"] != uid:
+            # session_key collision across users — do not honor foreign checkpoint.
+            cp = None
         if cp and cp.get("last_batch_hash") == batch:
             return {
                 "messages_captured": 0,
@@ -250,8 +308,9 @@ class MemoryEngine:
             )
 
         # Priority tilt: high-priority atoms rank above equally-similar low-priority ones.
+        # Keep full float for ordering; round only at the end so inject ranks don't collapse.
         for r in memory_results:
-            r["score"] = round(_priority_weight(r["score"], r.get("priority")), 4)
+            r["score"] = _priority_weight(r["score"], r.get("priority"))
 
         memory_results.sort(key=lambda x: x["score"], reverse=True)
         primary = memory_results[:top_k]
@@ -280,7 +339,9 @@ class MemoryEngine:
                         seen.add(mid)
                         unique_ids.append(mid)
             if unique_ids:
-                scenario_memories = await self.storage.get_memories_by_ids(unique_ids[:20])
+                scenario_memories = await self.storage.get_memories_by_ids(
+                    unique_ids[:20], user_id=uid
+                )
                 for sm in scenario_memories:
                     if sm["id"] not in existing_ids:
                         sm["metadata"] = sm.get("metadata") or {}
@@ -295,13 +356,17 @@ class MemoryEngine:
             filled = []
             for i, item in enumerate(injects[:slots]):
                 item = dict(item)
-                item["score"] = round(floor - (i + 1) * 1e-4, 4)
+                # Distinct sub-ranks without round(4) collisions.
+                item["score"] = floor - (i + 1) * 1e-6
                 meta = dict(item.get("metadata") or {})
                 if item.get("type") == "instruction" or meta.get("_instruction"):
                     meta["_instruction"] = True
                 item["metadata"] = meta
                 filled.append(item)
             results = primary + filled
+
+        for r in results:
+            r["score"] = round(float(r["score"]), 6)
 
         return {
             "results": results,
@@ -333,7 +398,47 @@ class MemoryEngine:
             }
 
         memories = await self.storage.get_all_memories(uid, limit=200)
-        summary = await self.extractor.generate_persona([m["text"] for m in memories])
+        try:
+            summary = await self.extractor.generate_persona([m["text"] for m in memories])
+        except Exception as e:
+            logger.error("Persona generation failed for %s: %s", uid, e)
+            # Do not cache failure strings — keep prior cache or return ephemeral error.
+            if cached:
+                return {
+                    "user_id": uid,
+                    "summary": cached["summary"],
+                    "memory_count": count,
+                    "last_updated": cached["generated_at"],
+                    "trust": trust,
+                }
+            return {
+                "user_id": uid,
+                "summary": "Persona unavailable (generation failed).",
+                "memory_count": count,
+                "last_updated": memories[0]["created_at"] if memories else None,
+                "trust": trust,
+            }
+        bad = (
+            not (summary or "").strip()
+            or summary.strip().lower().startswith("error")
+            or summary.strip() == "No persona available yet."
+        )
+        if bad:
+            if cached:
+                return {
+                    "user_id": uid,
+                    "summary": cached["summary"],
+                    "memory_count": count,
+                    "last_updated": cached["generated_at"],
+                    "trust": trust,
+                }
+            return {
+                "user_id": uid,
+                "summary": "Persona unavailable (empty generation).",
+                "memory_count": count,
+                "last_updated": memories[0]["created_at"] if memories else None,
+                "trust": trust,
+            }
         generated_at = await self.storage.save_persona_cache(uid, summary, count)
 
         return {
@@ -362,10 +467,15 @@ class MemoryEngine:
         memory_texts = [m["text"] for m in memories]
         memory_ids = [m["id"] for m in memories]
 
-        grouped = await self.extractor.group_into_scenarios(
-            memory_texts=memory_texts,
-            existing_scenarios=existing_scenarios,
-        )
+        try:
+            grouped = await self.extractor.group_into_scenarios(
+                memory_texts=memory_texts,
+                existing_scenarios=existing_scenarios,
+            )
+        except Exception as e:
+            # Distinguish LLM failure from genuine empty grouping — do not spin forever silent.
+            logger.error("Scenario grouping failed for %s: %s", user_id, e)
+            return
 
         if not grouped:
             logger.info("Scenario group empty for %s — keeping existing L2", user_id)

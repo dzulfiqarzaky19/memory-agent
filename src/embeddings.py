@@ -15,6 +15,15 @@ from config import (
 )
 
 
+def _assert_embedding_dims(vectors: list[list[float]], dims: int) -> list[list[float]]:
+    for i, vec in enumerate(vectors):
+        if len(vec) != dims:
+            raise ValueError(
+                f"embedding[{i}] dim {len(vec)} != expected dimensions={dims}"
+            )
+    return vectors
+
+
 class EmbeddingProvider(abc.ABC):
     @abc.abstractmethod
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -59,7 +68,8 @@ class OpenAICompatibleEmbedding(EmbeddingProvider):
             )
             resp.raise_for_status()
             data = resp.json()["data"]
-            return [item["embedding"] for item in sorted(data, key=lambda x: x["index"])]
+            vectors = [item["embedding"] for item in sorted(data, key=lambda x: x["index"])]
+            return _assert_embedding_dims(vectors, self._dims)
 
 
 class LocalONNXEmbedding(EmbeddingProvider):
@@ -82,7 +92,8 @@ class LocalONNXEmbedding(EmbeddingProvider):
         if not texts:
             return []
         embeddings = self._model.encode(texts, normalize_embeddings=True)
-        return [vec.tolist() for vec in embeddings]
+        vectors = [vec.tolist() for vec in embeddings]
+        return _assert_embedding_dims(vectors, self._dims)
 
 
 def create_embedding_provider(
