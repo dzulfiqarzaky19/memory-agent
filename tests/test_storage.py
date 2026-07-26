@@ -294,11 +294,80 @@ async def test_mark_extraction_success_watermark_not_now(db):
     window = await db.get_conversations_since(uid, since=None, limit=2)
     assert [c["content"] for c in window] == ["old", "mid"]
     wm = max(c["created_at"] for c in window)
-    await db.mark_extraction_success(uid, watermark_at=wm)
+    wm_id = window[-1]["id"]
+    await db.mark_extraction_success(uid, watermark_at=wm, last_extraction_id=wm_id)
     state = await db.get_extraction_state(uid)
     assert state["last_extraction_at"] == wm
-    rest = await db.get_conversations_since(uid, since=state["last_extraction_at"])
+    assert state["last_extraction_id"] == wm_id
+    rest = await db.get_conversations_since(
+        uid,
+        since=state["last_extraction_at"],
+        after_id=state["last_extraction_id"],
+    )
     assert [c["content"] for c in rest] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_advance_extraction_watermark_keeps_counter(db):
+    uid = "test-advance-wm"
+    await db.save_conversation(uid, "user", "a")
+    await db.save_conversation(uid, "user", "b")
+    rows = await db.get_conversations_since(uid, since=None, limit=10)
+    await db.bump_conversation_counter(uid, 5)
+    await db.advance_extraction_watermark(
+        uid,
+        watermark_at=rows[0]["created_at"],
+        last_extraction_id=rows[0]["id"],
+    )
+    state = await db.get_extraction_state(uid)
+    assert state["conversations_seen"] == 5
+    assert state["last_extraction_at"] == rows[0]["created_at"]
+    assert state["last_extraction_id"] == rows[0]["id"]
+    # advance does not claim final ok
+    assert state["last_extract_ok"] is not True
+
+    rest = await db.get_conversations_since(
+        uid,
+        since=state["last_extraction_at"],
+        after_id=state["last_extraction_id"],
+    )
+    assert [c["content"] for c in rest] == ["b"]
+
+
+@pytest.mark.asyncio
+async def test_get_conversations_since_equal_ts_keyset(db):
+    from datetime import datetime, timezone
+
+    uid = "test-eq-ts-keyset"
+    fixed = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    ids = []
+    for i in range(5):
+        rid = await db.save_conversation(uid, "user", f"same-ts-{i}")
+        ids.append(rid)
+        async with db._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE conversations SET created_at = $2 WHERE id = $1",
+                rid,
+                fixed,
+            )
+    page1 = await db.get_conversations_since(uid, since=None, limit=2)
+    assert len(page1) == 2
+    page2 = await db.get_conversations_since(
+        uid,
+        since=page1[-1]["created_at"],
+        after_id=page1[-1]["id"],
+        limit=10,
+    )
+    # UUID id order ≠ insert order; keyset must partition without loss/dup.
+    all_contents = {f"same-ts-{i}" for i in range(5)}
+    p1 = {c["content"] for c in page1}
+    p2 = {c["content"] for c in page2}
+    assert len(page2) == 3
+    assert p1.isdisjoint(p2)
+    assert p1 | p2 == all_contents
+    # created_at-only warm path orphans equal-ts tail
+    orphaned = await db.get_conversations_since(uid, since=page1[-1]["created_at"], limit=10)
+    assert orphaned == []
 
 
 @pytest.mark.asyncio

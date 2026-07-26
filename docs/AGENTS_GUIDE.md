@@ -32,41 +32,44 @@ Atomic Fact (L1) ─── stored in `memories` table with pgvector embedding
 | L2 | `scenarios` | Grouped related facts | Every 10 new L1 memories |
 | L3 | (computed) | User personality summary | On-demand via `GET /persona/{id}` |
 
-## Data Flow (ADD)
+## Data Flow (ADD / CAPTURE) — queue, not sync extract
 
 ```
-Agent → POST /add(messages)
-  ├── 1. Save each turn → conversations (L0)
-  ├── 2. Bump conversational counter
-  ├── 3. Counter >= EXTRACTION_EVERY_N_TURNS?
-  │     └── YES →
-  │           a. LLM extracts atomic facts from pending conversations
-  │           b. Embedder generates vector for each fact
-  │           c. Store in memories table (L1)
-  │           d. Every 10 L1s → rebuild scenarios (L2)
-  └── 4. Return { memories_added, memory_ids }
+Agent/host → POST /add or POST /capture
+  ├── 1. Save turns → conversations (L0)
+  ├── 2. capture: session checkpoint + batch-hash dedupe (idempotent retry)
+  ├── 3. Bump counter; if due → enqueue extraction_jobs (one live job/user)
+  └── 4. Return immediately (memories_added=0 on hot path; extract_status=queued|skipped)
+
+Worker (src/worker.py) leases job:
+  ├── page L0 since watermark → LLM extract atoms → embed → memories (L1)
+  ├── every 10 new L1 → rebuild scenarios (L2)
+  └── mark success / failure+retry  (never hold a pool conn across LLM)
 ```
+
+Host Stop hook should call **`/capture`**, not depend on the model. MCP `store_memories` is fallback (`/add` path).
+
+Implementers: see `../.claude/rules/architecture.md` — **no LLM in request handlers**.
 
 ## Data Flow (SEARCH)
 
 ```
 Agent → POST /search(query)
-  ├── 1. Embed query → vector
-  ├── 2. Vector cosine search (semantic)
-  ├── 3. Keyword trigram search (exact match)
-  ├── 4. RRF fusion of both rankings
-  ├── 5. Scenario / instruction fill: unmatched L2-linked + instructions fill remaining top_k
-  ├── 6. (instructions ordered first among injects, then scenario-linked)
-  └── 7. Return ranked results
+  ├── 1. memory_trust (stale/lag banner)
+  ├── 2. Embed query → vector
+  ├── 3. Vector cosine + keyword trgm → RRF fusion
+  ├── 4. Priority tilt, recency/conflict demote
+  ├── 5. Instruction + scenario fill for remaining top_k slots
+  └── 6. Return results + stale + trust  (empty only if l1_count==0)
 ```
 
 ## MCP Tools
 
 | Tool | What It Does | When To Call |
 |------|--------------|-------------|
-| `search_memories(user_id, query)` | Recall relevant memories | Before responding to user |
-| `store_memories(user_id, messages)` | Store exchange after replying | After each assistant response |
-| `get_persona(user_id)` | Get user profile summary | At session start |
+| `search_memories(user_id, query)` | Recall relevant memories | Before responding when history matters |
+| `store_memories(user_id, messages)` | Fallback L0 write if host capture missing | Not every turn when Stop→/capture is live |
+| `get_persona(user_id)` | User profile summary | Session start |
 | `reload_config(model, base_url?)` | Hot-swap LLM (server must allow reload) | Ops only |
 
 ## Configuration — LLM & Embedding Providers

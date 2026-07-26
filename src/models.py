@@ -13,16 +13,24 @@ class Role(str, Enum):
     system = "system"
 
 
+# Server caps sit well above the Claude Code hook's 2000/2500-char clip so
+# auto-capture is never rejected; they exist to bound self-inflicted payloads.
+MAX_CONTENT_CHARS = 32_000
+MAX_MESSAGES = 200
+MAX_ID_CHARS = 200
+MAX_QUERY_CHARS = 4_000
+
+
 class Message(BaseModel):
     role: Role
-    content: str
-    name: Optional[str] = None
+    content: str = Field(..., max_length=MAX_CONTENT_CHARS)
+    name: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
 
 
 class AddRequest(BaseModel):
-    messages: list[Message]
-    user_id: str = Field(..., min_length=1)
-    agent_id: Optional[str] = None
+    messages: list[Message] = Field(..., max_length=MAX_MESSAGES)
+    user_id: str = Field(..., min_length=1, max_length=MAX_ID_CHARS)
+    agent_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
     metadata: Optional[dict] = None
 
 
@@ -34,10 +42,10 @@ class AddResponse(BaseModel):
 
 
 class CaptureRequest(BaseModel):
-    messages: list[Message]
-    user_id: str = Field(..., min_length=1)
-    session_key: str = Field(..., min_length=1)
-    agent_id: Optional[str] = None
+    messages: list[Message] = Field(..., max_length=MAX_MESSAGES)
+    user_id: str = Field(..., min_length=1, max_length=MAX_ID_CHARS)
+    session_key: str = Field(..., min_length=1, max_length=MAX_ID_CHARS)
+    agent_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
     metadata: Optional[dict] = None
 
 
@@ -52,10 +60,10 @@ class CaptureResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1)
-    user_id: str = Field(..., min_length=1)
+    query: str = Field(..., min_length=1, max_length=MAX_QUERY_CHARS)
+    user_id: str = Field(..., min_length=1, max_length=MAX_ID_CHARS)
     top_k: int = Field(default=RECALL_MAX_RESULTS, ge=1, le=100)
-    agent_id: Optional[str] = None
+    agent_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
 
 
 class MemoryResult(BaseModel):
@@ -82,12 +90,15 @@ class MemoryTrust(BaseModel):
     last_extract_attempt_at: Optional[datetime] = None
     extraction_lag_seconds: Optional[float] = None
     extraction_lag_exceeded: bool = False
+    stale_seconds: int = 0
     recall_trusted: bool = False
 
 
 class SearchResponse(BaseModel):
     results: list[MemoryResult]
     total: int
+    stale: bool = False
+    stale_seconds: int = 0
     trust: Optional[MemoryTrust] = None
 
 
@@ -96,6 +107,8 @@ class PersonaResponse(BaseModel):
     summary: str
     memory_count: int
     last_updated: Optional[datetime] = None
+    stale: bool = False
+    stale_seconds: int = 0
     trust: Optional[MemoryTrust] = None
 
 
@@ -120,6 +133,8 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     memory_count: int
+    extraction_queued: int = 0
+    extraction_dead: int = 0
 
 
 class ReloadConfig(BaseModel):

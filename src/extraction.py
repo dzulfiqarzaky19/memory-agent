@@ -212,19 +212,42 @@ Only include scenarios with at least 1 memory."""
                 )
         return result
 
-    async def generate_persona(self, memories: list[str]) -> str:
-        memories_text = "\n".join(f"- {m}" for m in memories)
+    async def generate_persona(self, memories: list) -> str:
+        """memories: list[str] or list[dict] with text/created_at (prefer dicts for conflict)."""
+        lines: list[str] = []
+        for m in memories:
+            if isinstance(m, dict):
+                text = (m.get("text") or "").strip()
+                ts = m.get("created_at")
+                stamp = ""
+                if ts is not None:
+                    try:
+                        stamp = str(ts)[:19]
+                    except Exception:
+                        stamp = ""
+                if text:
+                    lines.append(f"- [{stamp}] {text}" if stamp else f"- {text}")
+            else:
+                t = str(m).strip()
+                if t:
+                    lines.append(f"- {t}")
+        memories_text = "\n".join(lines)
         prompt = f"""Based on the following memories about a user, generate a concise persona summary.
 Write it as a natural paragraph that captures who this person is, what they care about, and how they work.
 
-MEMORIES:
+Conflict rule: when two memories contradict (e.g. editor, stack, location), prefer the NEWER dated fact and omit or mark the older as historical. Do not present both as current truth.
+
+MEMORIES (older → may be outdated; timestamps when present):
 {memories_text}
 
 Persona:"""
 
         # Raise on failure — caller must not cache error strings as persona.
         return await self._call_llm(
-            system="You are a persona synthesis engine. Generate a concise, accurate user profile from extracted memories.",
+            system=(
+                "You are a persona synthesis engine. Generate a concise, accurate user profile. "
+                "Prefer newer memories when facts conflict."
+            ),
             user=prompt,
         )
 

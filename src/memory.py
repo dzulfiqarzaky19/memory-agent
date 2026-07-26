@@ -9,7 +9,10 @@ from config import (
     EXTRACTION_EVERY_N_TURNS,
     EXTRACTION_MAX_LAG_SECONDS,
     PERSONA_EVERY_N_MEMORIES,
+    RECALL_CONFLICT_DEMOTE,
+    RECALL_CONFLICT_JACCARD,
     RECALL_MAX_RESULTS,
+    RECALL_RECENCY_HALF_LIFE_DAYS,
     RECALL_RRF_K,
     RECALL_SIMILARITY_THRESHOLD,
     RECALL_STRATEGY,
@@ -54,6 +57,88 @@ def _aware(ts: datetime) -> datetime:
     return ts
 
 
+def _recency_multiplier(created_at, half_life_days: float) -> float:
+    """1.0 when brand-new → ~0.5 when age ≫ half-life. half_life<=0 disables."""
+    if half_life_days <= 0 or created_at is None:
+        return 1.0
+    age_days = max(0.0, (_lag_seconds(created_at) or 0.0) / 86400.0)
+    return 0.5 + 0.5 / (1.0 + age_days / half_life_days)
+
+
+def _token_set(text: str) -> set[str]:
+    buf: list[str] = []
+    for ch in text or "":
+        buf.append(ch.lower() if ch.isalnum() else " ")
+    return {t for t in "".join(buf).split() if len(t) > 2}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    return inter / len(a | b)
+
+
+def _apply_recency_and_conflict(
+    rows: list[dict],
+    *,
+    half_life_days: float | None = None,
+    jaccard_thresh: float | None = None,
+    demote: float | None = None,
+) -> list[dict]:
+    """Boost newer atoms; demote older near-duplicates in the result set (no deletes)."""
+    if not rows:
+        return rows
+    # Read config at call time so tests can monkeypatch module attrs.
+    hl = RECALL_RECENCY_HALF_LIFE_DAYS if half_life_days is None else half_life_days
+    jac = RECALL_CONFLICT_JACCARD if jaccard_thresh is None else jaccard_thresh
+    dem = RECALL_CONFLICT_DEMOTE if demote is None else demote
+    out: list[dict] = []
+    for r in rows:
+        item = dict(r)
+        mult = _recency_multiplier(item.get("created_at"), hl)
+        item["score"] = float(item.get("score") or 0.0) * mult
+        if mult != 1.0:
+            meta = dict(item.get("metadata") or {})
+            meta["_recency_mult"] = round(mult, 4)
+            item["metadata"] = meta
+        out.append(item)
+
+    if jac > 0 and dem < 1.0 and len(out) > 1:
+        tokens = [_token_set(r.get("text") or "") for r in out]
+        demoted: set[int] = set()
+        for i in range(len(out)):
+            for j in range(i + 1, len(out)):
+                if _jaccard(tokens[i], tokens[j]) < jac:
+                    continue
+                ti = out[i].get("created_at")
+                tj = out[j].get("created_at")
+                if ti is None or tj is None:
+                    continue
+                older_i = _aware(ti) < _aware(tj)
+                older = i if older_i else j
+                newer = j if older_i else i
+                if older in demoted:
+                    continue
+                out[older]["score"] = float(out[older]["score"]) * dem
+                meta = dict(out[older].get("metadata") or {})
+                meta["_conflict_demoted"] = True
+                meta["_superseded_by"] = out[newer].get("id")
+                out[older]["metadata"] = meta
+                demoted.add(older)
+
+    out.sort(
+        key=lambda x: (
+            float(x.get("score") or 0.0),
+            _aware(x["created_at"]).timestamp() if x.get("created_at") else 0.0,
+        ),
+        reverse=True,
+    )
+    return out
+
+
 class MemoryEngine:
     def __init__(self, storage: Storage, embedder: EmbeddingProvider, extractor: LLMExtractor):
         self.storage = storage
@@ -94,6 +179,15 @@ class MemoryEngine:
                 and not lag_exceeded
             )
         pending = seen > 0 or behind_watermark or never_extracted
+        # How much conversation exists that L1 has not mined yet (0 = caught up).
+        if latest_l0 is None:
+            stale_seconds = 0
+        elif last_at is None:
+            stale_seconds = int(max(0.0, _lag_seconds(latest_l0) or 0.0))
+        else:
+            stale_seconds = int(
+                max(0.0, (_aware(latest_l0) - _aware(last_at)).total_seconds())
+            )
         return {
             "user_id": uid,
             "l0_count": l0,
@@ -108,6 +202,7 @@ class MemoryEngine:
             "last_extract_attempt_at": state.get("last_extract_attempt_at"),
             "extraction_lag_seconds": lag,
             "extraction_lag_exceeded": lag_exceeded,
+            "stale_seconds": stale_seconds,
             "recall_trusted": bool(trusted),
         }
 
@@ -129,72 +224,114 @@ class MemoryEngine:
             )
 
         user_turns = sum(1 for m in messages if m.get("role") == "user")
-        memories_added = 0
-        memory_ids: list[str] = []
         extract_status = "skipped"
 
         if user_turns:
             state = await self.storage.bump_conversation_counter(uid, user_turns)
-            conversations_seen = state["conversations_seen"]
-            last_extraction_at = state["last_extraction_at"]
+            if state["conversations_seen"] >= EXTRACTION_EVERY_N_TURNS:
+                # Never extract on the request path — an 8s host hook cannot wait
+                # on a 300s LLM call. Queue it; the worker drains durably.
+                await self.storage.enqueue_extraction_job(uid, agent_id)
+                extract_status = "queued"
 
-            if conversations_seen >= EXTRACTION_EVERY_N_TURNS:
-                # Page through pending L0 until empty. Watermark = last mined
-                # created_at (not now()); keyset (created_at, id) drains ties.
-                cold_limit = max(EXTRACTION_EVERY_N_TURNS * 4, 40)
-                window_limit = cold_limit if last_extraction_at is None else 200
-                cursor_at = last_extraction_at
-                cursor_id: Optional[str] = None
-                try:
-                    mined_any = False
-                    while True:
-                        pending = await self.storage.get_conversations_since(
-                            uid,
-                            since=cursor_at,
-                            limit=window_limit,
-                            after_id=cursor_id,
-                        )
-                        if not pending:
-                            if not mined_any:
-                                # Clear cadence only — keep prior watermark (not now()).
-                                await self.storage.mark_extraction_success(
-                                    uid, watermark_at=cursor_at
-                                )
-                                extract_status = "empty_window"
-                            break
+        return {
+            "memories_added": 0,
+            "memory_ids": [],
+            "extract_status": extract_status,
+            "user_id": uid,
+        }
 
-                        extracted = await self._extract_and_store(uid, pending, agent_id)
-                        batch_n = len(extracted)
-                        memories_added += batch_n
-                        if extracted:
-                            memory_ids.extend(m["id"] for m in extracted)
+    async def run_extraction(
+        self,
+        user_id: str,
+        agent_id: Optional[str] = None,
+    ) -> dict:
+        """Drain pending L0 into L1 (+L2). Worker-owned; never called from a request.
 
-                        last_row = pending[-1]
-                        watermark = last_row["created_at"]
-                        await self.storage.mark_extraction_success(
-                            uid, watermark_at=watermark
-                        )
-                        cursor_at = watermark
-                        cursor_id = last_row["id"]
-                        mined_any = True
-                        extract_status = "ok" if memories_added else "ok_no_facts"
+        Raises on LLM/storage failure so the queue can retry — the caller marks
+        extraction_state failed before re-raising.
+        """
+        uid = canonicalize_user_id(user_id)
+        state = await self.storage.get_extraction_state(uid) or {}
+        last_extraction_at = state.get("last_extraction_at")
+        last_extraction_id = state.get("last_extraction_id")
 
-                        got = len(pending)
-                        if got < window_limit:
-                            break
-                        window_limit = 200
+        memories_added = 0
+        memory_ids: list[str] = []
+        extract_status = "skipped"
 
-                    if memories_added:
-                        memories_since_scenario = await self.storage.bump_scenario_counter(
-                            uid, memories_added
-                        )
-                        if memories_since_scenario >= SCENARIO_REBUILD_INTERVAL:
-                            await self._rebuild_scenarios(uid)
-                            await self.storage.reset_scenario_counter(uid)
-                except Exception as e:
-                    logger.error("Extraction failed for %s: %s", uid, e)
-                    await self.storage.mark_extraction_failure(uid, str(e))
-                    extract_status = "failed"
+        # Page through pending L0 until empty. Intermediate pages advance
+        # the durable (created_at, id) keyset only; final drain clears cadence.
+        cold_limit = max(EXTRACTION_EVERY_N_TURNS * 4, 40)
+        window_limit = cold_limit if last_extraction_at is None else 200
+        cursor_at = last_extraction_at
+        cursor_id: Optional[str] = last_extraction_id
+        try:
+            mined_any = False
+            while True:
+                pending = await self.storage.get_conversations_since(
+                    uid,
+                    since=cursor_at,
+                    limit=window_limit,
+                    after_id=cursor_id,
+                )
+                if not pending:
+                    # Full drain (or empty poll): clear cadence; keep cursor.
+                    await self.storage.mark_extraction_success(
+                        uid,
+                        watermark_at=cursor_at,
+                        last_extraction_id=cursor_id,
+                    )
+                    if not mined_any:
+                        extract_status = "empty_window"
+                    break
+
+                extracted = await self._extract_and_store(uid, pending, agent_id)
+                memories_added += len(extracted)
+                if extracted:
+                    memory_ids.extend(m["id"] for m in extracted)
+
+                last_row = pending[-1]
+                watermark = last_row["created_at"]
+                page_id = last_row["id"]
+                got = len(pending)
+                mined_any = True
+                extract_status = "ok" if memories_added else "ok_no_facts"
+
+                if got < window_limit:
+                    # Last page — final success zeros counter.
+                    await self.storage.mark_extraction_success(
+                        uid,
+                        watermark_at=watermark,
+                        last_extraction_id=page_id,
+                    )
+                    break
+
+                # More pages likely — advance cursor only; keep extract due.
+                await self.storage.advance_extraction_watermark(
+                    uid,
+                    watermark_at=watermark,
+                    last_extraction_id=page_id,
+                )
+                cursor_at = watermark
+                cursor_id = page_id
+                window_limit = 200
+
+            if memories_added:
+                memories_since_scenario = await self.storage.bump_scenario_counter(
+                    uid, memories_added
+                )
+                if memories_since_scenario >= SCENARIO_REBUILD_INTERVAL:
+                    await self._rebuild_scenarios(uid)
+                    await self.storage.reset_scenario_counter(uid)
+        except Exception as e:
+            logger.error("Extraction failed for %s: %s", uid, e)
+            await self.storage.mark_extraction_failure(
+                uid,
+                str(e),
+                keep_due_at_least=EXTRACTION_EVERY_N_TURNS,
+            )
+            raise
 
         return {
             "memories_added": memories_added,
@@ -230,46 +367,30 @@ class MemoryEngine:
                 "extract_status": "skipped",
             }
 
-        batch = _batch_hash(cleaned)
-        cp = await self.storage.get_capture_checkpoint(session_key)
-        if cp and cp.get("user_id") and cp["user_id"] != uid:
-            # session_key collision across users — do not honor foreign checkpoint.
-            cp = None
-        if cp and cp.get("last_batch_hash") == batch:
-            return {
-                "messages_captured": 0,
-                "memories_added": 0,
-                "memory_ids": [],
-                "duplicate": True,
-                "messages_seen": cp["messages_seen"],
-                "user_id": uid,
-                "extract_status": "skipped",
-            }
-
         meta = dict(metadata or {})
         meta["session_key"] = session_key
         meta["source"] = meta.get("source") or "auto-capture"
-        result = await self.add(
-            user_id=uid,
-            messages=cleaned,
-            agent_id=agent_id,
-            metadata=meta,
-        )
-        seen = (cp["messages_seen"] if cp else 0) + len(cleaned)
-        await self.storage.upsert_capture_checkpoint(
+
+        # Single transaction: dedupe check, L0, counter, checkpoint, job.
+        # Checkpoint lands before extraction exists to fail, so a hook timeout
+        # after commit cannot duplicate L0 on retry.
+        result = await self.storage.capture_atomic(
             session_key=session_key,
             user_id=uid,
-            messages_seen=seen,
-            last_batch_hash=batch,
+            messages=cleaned,
+            batch_hash=_batch_hash(cleaned),
+            agent_id=agent_id,
+            metadata=meta,
+            extract_every_n=EXTRACTION_EVERY_N_TURNS,
         )
         return {
-            "messages_captured": len(cleaned),
-            "memories_added": result["memories_added"],
-            "memory_ids": result["memory_ids"],
-            "duplicate": False,
-            "messages_seen": seen,
+            "messages_captured": 0 if result["duplicate"] else len(cleaned),
+            "memories_added": 0,
+            "memory_ids": [],
+            "duplicate": result["duplicate"],
+            "messages_seen": result["messages_seen"],
             "user_id": uid,
-            "extract_status": result.get("extract_status", "skipped"),
+            "extract_status": result["extract_status"],
         }
 
     async def search(
@@ -281,11 +402,20 @@ class MemoryEngine:
     ) -> dict:
         uid = canonicalize_user_id(user_id)
         trust = await self.memory_trust(uid)
-        # Untrusted recall must not look like answers — empty + trust banner only.
-        if not trust.get("recall_trusted"):
-            return {"results": [], "total": 0, "trust": trust}
+        stale = not trust.get("recall_trusted")
+        stale_seconds = int(trust.get("stale_seconds") or 0)
+        # Untrusted serves stale L1 with a loud banner — amnesia is worse than lag.
+        # Hard-empty only when there is genuinely nothing to serve.
+        if not trust["l1_count"]:
+            return {
+                "results": [],
+                "total": 0,
+                "stale": stale,
+                "stale_seconds": stale_seconds,
+                "trust": trust,
+            }
 
-        query_embedding = self.embedder.embed([query])[0]
+        query_embedding = (await self.embedder.aembed([query]))[0]
         threshold = RECALL_SIMILARITY_THRESHOLD
 
         if RECALL_STRATEGY == "hybrid":
@@ -314,12 +444,11 @@ class MemoryEngine:
                 agent_id=agent_id,
             )
 
-        # Priority tilt: high-priority atoms rank above equally-similar low-priority ones.
+        # Priority tilt, then mild recency + conflict demote (ADD-only; no deletes).
         # Keep full float for ordering; round only at the end so inject ranks don't collapse.
         for r in memory_results:
             r["score"] = _priority_weight(r["score"], r.get("priority"))
-
-        memory_results.sort(key=lambda x: x["score"], reverse=True)
+        memory_results = _apply_recency_and_conflict(memory_results)
         primary = memory_results[:top_k]
         existing_ids = {r["id"] for r in primary}
 
@@ -378,6 +507,8 @@ class MemoryEngine:
         return {
             "results": results,
             "total": len(results),
+            "stale": stale,
+            "stale_seconds": stale_seconds,
             "trust": trust,
         }
 
@@ -385,46 +516,35 @@ class MemoryEngine:
         uid = canonicalize_user_id(user_id)
         trust = await self.memory_trust(uid)
         count = trust["l1_count"]
-        if count == 0:
+
+        def reply(summary: str, last_updated, memory_count: Optional[int] = None) -> dict:
             return {
                 "user_id": uid,
-                "summary": "No memories stored yet.",
-                "memory_count": 0,
-                "last_updated": None,
+                "summary": summary,
+                "memory_count": count if memory_count is None else memory_count,
+                "last_updated": last_updated,
+                "stale": not trust.get("recall_trusted"),
+                "stale_seconds": int(trust.get("stale_seconds") or 0),
                 "trust": trust,
             }
+
+        if count == 0:
+            return reply("No memories stored yet.", None, memory_count=0)
 
         cached = await self.storage.get_persona_cache(uid)
         if cached and (count - cached["memories_at_generation"]) < PERSONA_EVERY_N_MEMORIES:
-            return {
-                "user_id": uid,
-                "summary": cached["summary"],
-                "memory_count": count,
-                "last_updated": cached["generated_at"],
-                "trust": trust,
-            }
+            return reply(cached["summary"], cached["generated_at"])
 
         memories = await self.storage.get_all_memories(uid, limit=200)
+        newest = memories[0]["created_at"] if memories else None
         try:
-            summary = await self.extractor.generate_persona([m["text"] for m in memories])
+            summary = await self.extractor.generate_persona(memories)
         except Exception as e:
             logger.error("Persona generation failed for %s: %s", uid, e)
             # Do not cache failure strings — keep prior cache or return ephemeral error.
             if cached:
-                return {
-                    "user_id": uid,
-                    "summary": cached["summary"],
-                    "memory_count": count,
-                    "last_updated": cached["generated_at"],
-                    "trust": trust,
-                }
-            return {
-                "user_id": uid,
-                "summary": "Persona unavailable (generation failed).",
-                "memory_count": count,
-                "last_updated": memories[0]["created_at"] if memories else None,
-                "trust": trust,
-            }
+                return reply(cached["summary"], cached["generated_at"])
+            return reply("Persona unavailable (generation failed).", newest)
         bad = (
             not (summary or "").strip()
             or summary.strip().lower().startswith("error")
@@ -432,29 +552,11 @@ class MemoryEngine:
         )
         if bad:
             if cached:
-                return {
-                    "user_id": uid,
-                    "summary": cached["summary"],
-                    "memory_count": count,
-                    "last_updated": cached["generated_at"],
-                    "trust": trust,
-                }
-            return {
-                "user_id": uid,
-                "summary": "Persona unavailable (empty generation).",
-                "memory_count": count,
-                "last_updated": memories[0]["created_at"] if memories else None,
-                "trust": trust,
-            }
+                return reply(cached["summary"], cached["generated_at"])
+            return reply("Persona unavailable (empty generation).", newest)
         generated_at = await self.storage.save_persona_cache(uid, summary, count)
 
-        return {
-            "user_id": uid,
-            "summary": summary,
-            "memory_count": count,
-            "last_updated": generated_at,
-            "trust": trust,
-        }
+        return reply(summary, generated_at)
 
     async def get_scenarios(self, user_id: str) -> dict:
         uid = canonicalize_user_id(user_id)
@@ -495,7 +597,7 @@ class MemoryEngine:
             if not linked_ids:
                 continue
             scenario_text = f"{group['name']}: {group['description']}"
-            embedding = self.embedder.embed([scenario_text])[0]
+            embedding = (await self.embedder.aembed([scenario_text]))[0]
             built.append(
                 {
                     "name": group["name"],
@@ -532,7 +634,7 @@ class MemoryEngine:
         if not atoms:
             return []
 
-        embeddings = self.embedder.embed([a["content"] for a in atoms])
+        embeddings = await self.embedder.aembed([a["content"] for a in atoms])
         stored = []
         for atom, embedding in zip(atoms, embeddings):
             row_id = await self.storage.save_memory(

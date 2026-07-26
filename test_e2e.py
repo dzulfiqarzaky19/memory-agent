@@ -15,7 +15,16 @@ from memory import MemoryEngine
 
 TEST_USER = "_test_e2e"
 BASE = "http://localhost:8000"
-CLIENT = httpx.Client(timeout=httpx.Timeout(120.0))
+
+
+def _headers() -> dict:
+    """Door: send X-Memory-Key when MEMORY_API_SECRET is set (mirrors memory_mcp.py)."""
+    from config import MEMORY_API_SECRET
+
+    return {"X-Memory-Key": MEMORY_API_SECRET} if MEMORY_API_SECRET else {}
+
+
+CLIENT = httpx.Client(timeout=httpx.Timeout(120.0), headers=_headers())
 
 
 async def main():

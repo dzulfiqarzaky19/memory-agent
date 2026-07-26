@@ -1,171 +1,77 @@
 # memory-agent
 
-Local-first, agent-agnostic memory layer for AI agents. PostgreSQL + pgvector backend.
+Local-first, agent-agnostic **work-partner** memory (Postgres + pgvector). HTTP sidecar + MCP.
 
-## For Other Agents Continuing This Work
+Not a code graph → sibling **codescratch**. Not companion/brainify.
 
-This project is an **MCP-connected memory layer** for AI agents. PostgreSQL + pgvector backend.
-The root `.mcp.json` / `opencode.json` connect **two independent** MCP servers:
-- `memory` — user/session facts (this repo, Docker stdio)
-- `codescratch` — code structure graph for the open workspace (sibling project `D:/dev/projects/codescratch`, no shared state)
+## Two modes (read the right doc)
 
-You do NOT need to understand either internal codebase — use the MCP tools.
+| You are… | Read |
+|----------|------|
+| **Using** memory (recall/store in any session) | Protocol + MCP table below · `.claude/rules/memory.md` |
+| **Implementing / reviewing this repo** | `.claude/rules/architecture.md` first · then `database.md` / `docker.md` · use `cs_*` on `src/` |
 
-### Memory Protocol (FOLLOW THIS)
+Root `.mcp.json` / `opencode.json` wire two **independent** MCPs: `memory` (this) + `codescratch` (no shared state).
 
-**L0 durability** is host-driven when the Claude Code plugin is installed
-(`integrations/claude-code` Stop hook → `POST /capture`). Do not rely on the
-model remembering to store turns for capture.
+## Memory protocol (clients)
 
-Still use MCP for **recall**:
+**L0 durability** — host Stop hook → `POST /capture` when Claude plugin installed. Do not rely on the model for capture.
 
-**At session start**, recall the user persona:
-```
-Use the get_persona tool with the user's user_id
-```
+**Recall (MCP)** — still model/host driven:
 
-**Before responding to the user**, search for relevant memories:
-```
-Use the search_memories tool with the user's user_id and a brief query summary
-```
+- Session start: `get_persona` · `user_id=zaky` (lowercase)
+- Before answers that need history: `search_memories`
+- Manual store only if capture missing: `store_memories` with `user:\nassistant:` turns
 
-**Manual store** (other hosts / plugin missing) via MCP:
-```
-Use the store_memories tool with the user's user_id and the conversation formatted as:
-user: <message>
-assistant: <response>
-```
-
-### Quick MCP Tool Reference
-
-**Memory** (user/session — `user_id=zaky` lowercase):
-
-| Tool | Purpose | Key params |
-|------|---------|------------|
-| `search_memories` | Recall before responding | `user_id`, `query` |
-| `store_memories` | Manual store if auto-capture unavailable | `user_id`, `messages` |
-| `get_persona` | User profile at session start | `user_id` |
-
-HTTP auto-capture: `POST /capture` with `user_id`, `session_key`, `messages`.
-
-**Code structure** (this workspace’s TS/JS/Python graph — separate process):
+Read trust/`stale` on replies — empty + untrusted ≠ “user has no prefs.”
 
 | Tool | Purpose |
 |------|---------|
-| `cs_status` | Trust / stale / exact reindex command |
-| `cs_search` | Find symbol by name |
-| `cs_explore` | One symbol/file: callers, calls, imports, bindings |
-| `cs_callers` / `cs_callees` | Call edges |
-| `cs_impact` | Blast radius (`direction=up\|down\|both`) |
-| `cs_reindex` | Incremental reindex when trust=stale |
+| `search_memories` | Recall |
+| `store_memories` | Fallback L0 write via `/add` path |
+| `get_persona` | L3 summary |
 
-Prefer `cs_*` over blind grep for navigation. Memory ≠ code graph — never store code structure into memories or vice versa.
+HTTP: `POST /capture` · `POST /search` · `GET /persona/{id}` · `GET /health`.
 
-Prerequisite once per machine: `cd D:/dev/projects/codescratch && npm run build`.  
-First open of a repo: `cs_reindex` with `full=true` or CLI `node dist/cli.js init <repo>`.
+## Code structure (sibling)
 
-### Key Principles (do not violate)
+Prefer `cs_*` over blind grep for navigation in **this** tree when editing it.
 
-- **ADD-only extraction** — memories accumulate, nothing is ever overwritten or deleted
-- **Store wide, recall narrow** — capture everything, retrieve precisely
-- **Agent-agnostic** — HTTP sidecar or MCP stdio, no SDK dependency, no vendor lock-in
-- **Local-first** — PostgreSQL + pgvector, no cloud API required by default
+| Tool | Purpose |
+|------|---------|
+| `cs_status` / `cs_search` / `cs_explore` | Map |
+| `cs_callers` / `cs_callees` / `cs_impact` | Edges / blast radius |
+| Host `codescratch ensure` | Freshness — not routine agent `cs_reindex` |
 
-## Architecture
+See `.claude/rules/codescratch.md`. Never put code-graph facts into memories or the reverse.
 
-```
-src/
-├── server.py          # FastAPI HTTP server (the sidecar)
-├── memory.py          # Core memory engine (add/search/persona)
-├── storage.py         # PostgreSQL + pgvector backend
-├── extraction.py      # LLM fact extraction (ADD-only, no UPDATE)
-├── embeddings.py      # Pluggable embedding providers
-├── models.py          # Pydantic models / schemas
-└── config.py          # Reads from .env via python-dotenv
+## Principles
 
-memory_mcp.py          # MCP stdio server (for agent-native integration)
-opencode.json          # OpenCode MCP server config
-reset_db.py            # Wipe all data utility
-tests/
-├── conftest.py        # Fixtures (FakeEmbedding, db, engine, client)
-├── test_memory.py     # Memory engine tests
-└── test_storage.py    # Storage layer tests
-```
+- **Agent-agnostic** — HTTP or MCP; no vendor SDK lock-in
+- **Local-first** — Postgres + pgvector; embeddings/LLM configurable
+- **Fast writes** — capture/add enqueue extraction; worker + LLM off request path
+- **Recall degrades** — serve stale L1 with banner rather than amnesia
+- **Work partner** — prefs, decisions, instructions; thin craft continuity — not entertainment persona
 
-## Memory Layers (L0 → L3)
-
-Inspired by TencentDB Agent Memory's progressive disclosure:
-
-- **L0 Conversation** — raw dialogue turns (stored in `conversations` table)
-- **L1 Atom** — atomic facts extracted from conversations (stored in `memories` table with pgvector)
-- **L2 Scenario** — grouped facts into contextual scenes (stored in `scenarios` table, rebuilt every 10 new memories)
-- **L3 Persona** — user profile summary (computed on-demand from L1 atoms)
-
-## Recall Strategy
-
-When you `POST /search`, uses **hybrid retrieval** by default:
-
-1. **Vector search** — cosine similarity on pgvector embeddings (semantic)
-2. **Keyword search** — `pg_trgm` trigram similarity (exact term match)
-3. **RRF fusion** — Reciprocal Rank Fusion combines both rankings
-4. **Scenario / instruction fill** — unmatched L2-linked and instruction memories fill remaining `top_k` slots after matched results
-
-Switch via `RECALL_STRATEGY` env var: `hybrid`, `vector`, or `keyword`.
-
-## API
+## Layout (pointer)
 
 ```
-POST /add          — store conversation turns (greedy capture)
-POST /search       — targeted recall (semantic + keyword fusion)
-GET  /persona/{id} — user persona summary
-GET  /scenarios/{id} — list L2 scenario groups
-GET  /health
+src/server.py memory.py storage.py worker.py extraction.py
+src/migrations.py embeddings.py models.py config.py ids.py
+memory_mcp.py
+tests/   # single-process pytest against shared DB
+integrations/claude-code/   # Stop → /capture
 ```
 
-## Tech Stack
+Truth for paths/invariants: **`.claude/rules/architecture.md`**.
 
-- Python 3.12+ + FastAPI
-- PostgreSQL 16 + pgvector (via docker-compose)
-- Configurable embeddings (local ONNX or OpenAI-compatible)
-- Configurable LLM (OpenAI-compatible endpoint)
-- MCP stdio server (via `mcp` package)
-
-## Dev Commands
+## Dev
 
 ```bash
-# Start everything
 docker compose up -d
-
-# Run MCP server (alternative to HTTP API)
-python memory_mcp.py
-
-# Run tests
-pytest tests/ -v
-python test_e2e.py
-
-# Wipe all data
-python reset_db.py
+curl -s http://127.0.0.1:8000/health
+pytest tests/ -v          # one process
+# MCP: python memory_mcp.py  (or docker exec app)
 ```
 
-## Configuration
-
-All settings in `.env` (single source of truth). Copy `.env` and edit for your setup.
-
-### Key variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | `postgresql://postgres:localdev@localhost:5433/memory_agent` | PostgreSQL |
-| `EMBEDDING_PROVIDER` | `openai` | `openai` (OpenAI-compat / TEI) or `local` |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model (compose TEI) |
-| `EMBEDDING_DIMENSIONS` | `384` | Embedding vector dimensions (MiniLM) |
-| `EMBEDDING_BASE_URL` | falls back to `OPENAI_BASE_URL` (`http://127.0.0.1:1234/v1`); compose: `http://embeddings:80/v1` | Embedding API endpoint |
-| `LLM_PROVIDER` | (from `.env`) | LLM provider for extraction |
-| `LLM_MODEL` | (from `.env`) | LLM for extraction |
-| `LLM_BASE_URL` | (from `.env`) | LLM API endpoint |
-| `EXTRACTION_EVERY_N_TURNS` | `5` | Extract every N user turns |
-| `EXTRACTION_MAX_LAG_SECONDS` | `3600` | Wall-clock lag before recall untrusted (`0` off) |
-| `RECALL_STRATEGY` | `hybrid` | `hybrid`, `vector`, or `keyword` |
-| `RECALL_RRF_K` | `60` | RRF fusion constant |
-| `RECALL_SIMILARITY_THRESHOLD` | `0.3` | Vector similarity minimum |
-| `MEMORY_API_SECRET` | empty | Door: HTTP `X-Memory-Key`; empty = open |
+Config: `.env`. Door: `MEMORY_API_SECRET` → `X-Memory-Key`. Compose publishes `127.0.0.1:8000` / `5433`.

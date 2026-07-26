@@ -6,10 +6,12 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from config import (
     EMBEDDING_DIMENSIONS,
+    EXTRACTION_WORKER_ENABLED,
     MEMORY_ALLOW_RELOAD,
     MEMORY_API_SECRET,
     MEMORY_BIND_HOST,
@@ -34,6 +36,7 @@ from models import (
     MemoryResult,
 )
 from storage import Storage
+from worker import ExtractionWorker
 
 # Open without secret (liveness only). Everything else needs X-Memory-Key when set.
 _AUTH_OPEN_PATHS = frozenset({"/health"})
@@ -105,6 +108,11 @@ async def lifespan(app: FastAPI):
         )
     extractor = LLMExtractor()
     engine = MemoryEngine(storage=storage, embedder=embedder, extractor=extractor)
+    worker = ExtractionWorker(engine)
+    if EXTRACTION_WORKER_ENABLED:
+        worker.start()
+    else:
+        logger.warning("Extraction worker disabled — jobs will queue but not run")
     if MEMORY_API_SECRET:
         logger.info(
             "Memory agent started (API key required, embed_dims=%s)",
@@ -115,12 +123,19 @@ async def lifespan(app: FastAPI):
             "Memory agent started with MEMORY_API_SECRET unset — HTTP routes open on bind host"
         )
     yield
+    await worker.stop()
     await storage.close()
     logger.info("Memory agent stopped")
 
 
 app = FastAPI(title="memory-agent", version="0.1.0", lifespan=lifespan)
 app.add_middleware(MemoryKeyMiddleware)
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError) -> Response:
+    """Bad caller input (e.g. whitespace user_id on a path route) is 400, not 500."""
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -131,6 +146,8 @@ async def health():
         version="0.1.0",
         database="connected",
         memory_count=count,
+        extraction_queued=await storage.count_extraction_jobs("queued"),
+        extraction_dead=await storage.count_extraction_jobs("dead"),
     )
 
 
@@ -205,6 +222,8 @@ async def search_memories(req: SearchRequest):
             for r in results
         ],
         total=payload["total"],
+        stale=bool(payload.get("stale")),
+        stale_seconds=int(payload.get("stale_seconds") or 0),
         trust=_trust_model(payload.get("trust")),
     )
 
@@ -217,6 +236,8 @@ async def get_persona(user_id: str):
         summary=result["summary"],
         memory_count=result["memory_count"],
         last_updated=result.get("last_updated"),
+        stale=bool(result.get("stale")),
+        stale_seconds=int(result.get("stale_seconds") or 0),
         trust=_trust_model(result.get("trust")),
     )
 

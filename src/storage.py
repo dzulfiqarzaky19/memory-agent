@@ -12,6 +12,7 @@ from uuid import uuid4
 import asyncpg
 
 from config import DATABASE_URL, EMBEDDING_DIMENSIONS
+from migrations import run_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -29,110 +30,8 @@ def _memory_row(r, score: float) -> dict:
     }
 
 
-SCHEMA_SQL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
-CREATE TABLE IF NOT EXISTS conversations (
-    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-    user_id     TEXT NOT NULL,
-    agent_id    TEXT,
-    role        TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    metadata    JSONB DEFAULT '{}',
-    created_at  TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
-CREATE INDEX IF NOT EXISTS idx_conv_created ON conversations(created_at);
-
-CREATE TABLE IF NOT EXISTS memories (
-    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-    user_id     TEXT NOT NULL,
-    text        TEXT NOT NULL,
-    text_hash   TEXT NOT NULL,
-    embedding   vector({dims}),
-    metadata    JSONB DEFAULT '{}',
-    created_at  TIMESTAMPTZ DEFAULT now(),
-    updated_at  TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id);
-CREATE INDEX IF NOT EXISTS idx_mem_created ON memories(created_at);
-
--- Dedupe then enforce unique (user_id, text_hash). Idempotent boot migration.
-DELETE FROM memories a
- USING memories b
- WHERE a.user_id = b.user_id
-   AND a.text_hash = b.text_hash
-   AND (a.created_at > b.created_at
-        OR (a.created_at = b.created_at AND a.id > b.id));
-DROP INDEX IF EXISTS idx_mem_hash;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_user_hash ON memories(user_id, text_hash);
-
--- Full-text search column (generated) for keyword recall; trigram for fuzzy fallback.
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS text_tsv tsvector
-    GENERATED ALWAYS AS (to_tsvector('english', text)) STORED;
-CREATE INDEX IF NOT EXISTS idx_mem_tsv ON memories USING gin (text_tsv);
-CREATE INDEX IF NOT EXISTS idx_mem_trgm ON memories USING gin (text gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_mem_embedding ON memories
-    USING hnsw (embedding vector_cosine_ops);
-
--- Typed + prioritized atoms (TencentDB-style); per-agent scoping (mem0-style).
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS mem_type TEXT NOT NULL DEFAULT 'episodic';
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 50;
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS agent_id TEXT;
-CREATE INDEX IF NOT EXISTS idx_mem_type ON memories(user_id, mem_type);
-
-CREATE TABLE IF NOT EXISTS scenarios (
-    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-    user_id     TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    description TEXT NOT NULL,
-    embedding   vector({dims}),
-    memory_ids  JSONB DEFAULT '[]',
-    metadata    JSONB DEFAULT '{}',
-    created_at  TIMESTAMPTZ DEFAULT now(),
-    updated_at  TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_scen_user ON scenarios(user_id);
-CREATE INDEX IF NOT EXISTS idx_scen_created ON scenarios(created_at);
-CREATE INDEX IF NOT EXISTS idx_scen_embedding ON scenarios
-    USING hnsw (embedding vector_cosine_ops);
-
--- Persistent per-user cadence counters (survives restarts / shared across workers).
-CREATE TABLE IF NOT EXISTS extraction_state (
-    user_id                 TEXT PRIMARY KEY,
-    conversations_seen      INT NOT NULL DEFAULT 0,
-    memories_since_scenario INT NOT NULL DEFAULT 0,
-    updated_at              TIMESTAMPTZ DEFAULT now()
-);
-ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extraction_at TIMESTAMPTZ;
-ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extract_ok BOOLEAN;
-ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extract_error TEXT;
-ALTER TABLE extraction_state ADD COLUMN IF NOT EXISTS last_extract_attempt_at TIMESTAMPTZ;
-
-
--- Cached L3 persona; regenerated every N new memories instead of every request.
-CREATE TABLE IF NOT EXISTS personas (
-    user_id                TEXT PRIMARY KEY,
-    summary                TEXT NOT NULL,
-    memory_count           INT NOT NULL,
-    memories_at_generation INT NOT NULL,
-    generated_at           TIMESTAMPTZ DEFAULT now()
-);
-
--- Auto-capture session cursors (Tencent-style). last_batch_hash dedupes exact retries.
-CREATE TABLE IF NOT EXISTS capture_checkpoints (
-    session_key     TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    messages_seen   INT NOT NULL DEFAULT 0,
-    last_batch_hash TEXT,
-    updated_at      TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_capture_user ON capture_checkpoints(user_id);
-"""
+# Schema lives in migrations.py (versioned). Boot no longer executes DDL
+# unconditionally — see run_migrations().
 
 
 class Storage:
@@ -144,9 +43,13 @@ class Storage:
         self._pool = await asyncpg.create_pool(self._dsn, min_size=2, max_size=10)
         dims = EMBEDDING_DIMENSIONS
         async with self._pool.acquire() as conn:
-            await conn.execute(SCHEMA_SQL.replace("{dims}", str(dims)))
+            applied = await run_migrations(conn, dims)
             await self._ensure_embedding_dimensions(conn, dims)
-        logger.info("Storage initialized (pgvector schema ready, dims=%s)", dims)
+        logger.info(
+            "Storage initialized (dims=%s, migrations applied=%s)",
+            dims,
+            applied or "none",
+        )
 
     async def _ensure_embedding_dimensions(self, conn, dims: int) -> None:
         """If vector columns were created at a different width, rebuild them (data wipe)."""
@@ -301,6 +204,109 @@ class Storage:
                 messages_seen,
                 last_batch_hash,
             )
+
+    async def capture_atomic(
+        self,
+        *,
+        session_key: str,
+        user_id: str,
+        messages: list[dict],
+        batch_hash: str,
+        agent_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        extract_every_n: int = 5,
+    ) -> dict:
+        """L0 + checkpoint + extraction job in ONE transaction.
+
+        The checkpoint is written before any extraction exists to fail, so a host
+        hook timing out after commit cannot cause duplicate L0 on retry. The row
+        lock closes the check-then-act gap between reading and writing the
+        checkpoint — safe only because no LLM call happens inside this transaction.
+        """
+        meta_json = json.dumps(metadata or {})
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # Materialize the row so FOR UPDATE has something to lock; two
+                # concurrent first-writes for one session serialize here.
+                await conn.execute(
+                    """INSERT INTO capture_checkpoints (session_key, user_id, messages_seen)
+                       VALUES ($1, $2, 0)
+                       ON CONFLICT (session_key) DO NOTHING""",
+                    session_key,
+                    user_id,
+                )
+                cp = await conn.fetchrow(
+                    """SELECT user_id, messages_seen, last_batch_hash
+                       FROM capture_checkpoints
+                       WHERE session_key = $1
+                       FOR UPDATE""",
+                    session_key,
+                )
+                foreign = cp["user_id"] and cp["user_id"] != user_id
+                if not foreign and cp["last_batch_hash"] == batch_hash:
+                    return {
+                        "duplicate": True,
+                        "messages_seen": cp["messages_seen"],
+                        "extract_status": "skipped",
+                    }
+
+                seen_before = 0 if foreign else cp["messages_seen"]
+
+                for msg in messages:
+                    await conn.execute(
+                        """INSERT INTO conversations
+                               (id, user_id, agent_id, role, content, metadata)
+                           VALUES ($1, $2, $3, $4, $5, $6)""",
+                        str(uuid4()),
+                        user_id,
+                        agent_id,
+                        msg["role"],
+                        msg["content"],
+                        meta_json,
+                    )
+
+                extract_status = "skipped"
+                user_turns = sum(1 for m in messages if m.get("role") == "user")
+                if user_turns:
+                    seen = await conn.fetchval(
+                        """INSERT INTO extraction_state (user_id, conversations_seen)
+                           VALUES ($1, $2)
+                           ON CONFLICT (user_id) DO UPDATE
+                             SET conversations_seen =
+                                     extraction_state.conversations_seen + $2,
+                                 updated_at = now()
+                           RETURNING conversations_seen""",
+                        user_id,
+                        user_turns,
+                    )
+                    if seen >= extract_every_n:
+                        await conn.execute(
+                            """INSERT INTO extraction_jobs (user_id, agent_id)
+                               VALUES ($1, $2)
+                               ON CONFLICT DO NOTHING""",
+                            user_id,
+                            agent_id,
+                        )
+                        extract_status = "queued"
+
+                messages_seen = seen_before + len(messages)
+                await conn.execute(
+                    """UPDATE capture_checkpoints
+                       SET user_id = $2,
+                           messages_seen = $3,
+                           last_batch_hash = $4,
+                           updated_at = now()
+                       WHERE session_key = $1""",
+                    session_key,
+                    user_id,
+                    messages_seen,
+                    batch_hash,
+                )
+        return {
+            "duplicate": False,
+            "messages_seen": messages_seen,
+            "extract_status": extract_status,
+        }
 
     async def get_conversations_since(
         self,
@@ -835,7 +841,7 @@ class Storage:
                    ON CONFLICT (user_id) DO UPDATE
                      SET conversations_seen = extraction_state.conversations_seen + $2,
                          updated_at = now()
-                   RETURNING conversations_seen, last_extraction_at,
+                   RETURNING conversations_seen, last_extraction_at, last_extraction_id,
                              last_extract_ok, last_extract_error, last_extract_attempt_at""",
                 user_id,
                 n,
@@ -843,6 +849,7 @@ class Storage:
         return {
             "conversations_seen": row["conversations_seen"],
             "last_extraction_at": row["last_extraction_at"],
+            "last_extraction_id": row["last_extraction_id"],
             "last_extract_ok": row["last_extract_ok"],
             "last_extract_error": row["last_extract_error"],
             "last_extract_attempt_at": row["last_extract_attempt_at"],
@@ -851,8 +858,9 @@ class Storage:
     async def get_extraction_state(self, user_id: str) -> Optional[dict]:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                """SELECT conversations_seen, last_extraction_at, last_extract_ok,
-                          last_extract_error, last_extract_attempt_at, memories_since_scenario
+                """SELECT conversations_seen, last_extraction_at, last_extraction_id,
+                          last_extract_ok, last_extract_error, last_extract_attempt_at,
+                          memories_since_scenario
                    FROM extraction_state WHERE user_id = $1""",
                 user_id,
             )
@@ -861,6 +869,7 @@ class Storage:
         return {
             "conversations_seen": row["conversations_seen"],
             "last_extraction_at": row["last_extraction_at"],
+            "last_extraction_id": row["last_extraction_id"],
             "last_extract_ok": row["last_extract_ok"],
             "last_extract_error": row["last_extract_error"],
             "last_extract_attempt_at": row["last_extract_attempt_at"],
@@ -880,46 +889,86 @@ class Storage:
                 user_id,
             )
 
-    async def mark_extraction_success(
+    async def advance_extraction_watermark(
         self,
         user_id: str,
-        watermark_at: Optional[datetime] = None,
+        watermark_at: datetime,
+        last_extraction_id: str,
     ) -> None:
-        """Cadence complete: clear counter; set watermark only when provided.
+        """Partial page progress: durable (created_at, id) cursor only.
 
-        watermark_at = newest L0 *included* in a mined window (not wall-clock now).
-        watermark_at=None keeps the prior cursor (empty_window must not jump to now()).
+        Does not zero conversations_seen and does not claim final success.
+        Mid-pagination failures must leave extract still due.
         """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO extraction_state
-                       (user_id, conversations_seen, last_extraction_at,
+                       (user_id, conversations_seen, last_extraction_at, last_extraction_id,
+                        updated_at)
+                   VALUES ($1, 0, $2, $3, now())
+                   ON CONFLICT (user_id) DO UPDATE SET
+                       last_extraction_at = $2,
+                       last_extraction_id = $3,
+                       last_extract_attempt_at = now(),
+                       updated_at = now()""",
+                user_id,
+                watermark_at,
+                last_extraction_id,
+            )
+
+    async def mark_extraction_success(
+        self,
+        user_id: str,
+        watermark_at: Optional[datetime] = None,
+        last_extraction_id: Optional[str] = None,
+    ) -> None:
+        """Full drain complete: clear counter + ok; set watermark only when provided.
+
+        watermark_at = newest L0 *included* in a mined window (not wall-clock now).
+        watermark_at=None keeps the prior cursor (empty_window must not jump to now()).
+        last_extraction_id pairs with watermark for durable keyset resume.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO extraction_state
+                       (user_id, conversations_seen, last_extraction_at, last_extraction_id,
                         last_extract_ok, last_extract_error, last_extract_attempt_at, updated_at)
-                   VALUES ($1, 0, $2, true, NULL, now(), now())
+                   VALUES ($1, 0, $2, $3, true, NULL, now(), now())
                    ON CONFLICT (user_id) DO UPDATE SET
                        conversations_seen = 0,
                        last_extraction_at = COALESCE($2, extraction_state.last_extraction_at),
+                       last_extraction_id = COALESCE($3, extraction_state.last_extraction_id),
                        last_extract_ok = true,
                        last_extract_error = NULL,
                        last_extract_attempt_at = now(),
                        updated_at = now()""",
                 user_id,
                 watermark_at,
+                last_extraction_id,
             )
 
-    async def mark_extraction_failure(self, user_id: str, error: str) -> None:
-        """Do NOT reset conversations_seen — window must retry next turn."""
+    async def mark_extraction_failure(
+        self,
+        user_id: str,
+        error: str,
+        *,
+        keep_due_at_least: int = 1,
+    ) -> None:
+        """Mark fail; never clear cadence. Force counter due so next add retries."""
         err = (error or "unknown")[:500]
+        due = max(1, int(keep_due_at_least))
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """UPDATE extraction_state
                    SET last_extract_ok = false,
                        last_extract_error = $2,
                        last_extract_attempt_at = now(),
+                       conversations_seen = GREATEST(conversations_seen, $3),
                        updated_at = now()
                    WHERE user_id = $1""",
                 user_id,
                 err,
+                due,
             )
 
     async def reset_conversation_counter(self, user_id: str) -> None:
@@ -943,6 +992,118 @@ class Storage:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE extraction_state SET memories_since_scenario = 0 WHERE user_id = $1",
+                user_id,
+            )
+
+    # -- Extraction queue (durable, off the request path) --
+
+    async def enqueue_extraction_job(
+        self,
+        user_id: str,
+        agent_id: Optional[str] = None,
+        conn=None,
+    ) -> Optional[str]:
+        """Queue a drain for this user. No-op if one is already live (partial unique index).
+
+        Pass conn to enlist in the caller's transaction (capture_atomic).
+        """
+        sql = """INSERT INTO extraction_jobs (user_id, agent_id)
+                 VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING
+                 RETURNING id"""
+        if conn is not None:
+            return await conn.fetchval(sql, user_id, agent_id)
+        async with self._pool.acquire() as c:
+            return await c.fetchval(sql, user_id, agent_id)
+
+    async def claim_extraction_job(self, lease_seconds: int = 600) -> Optional[dict]:
+        """Lease one runnable job. Short transaction — never held across the LLM call."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE extraction_jobs SET
+                       status = 'running',
+                       attempts = attempts + 1,
+                       lease_until = now() + make_interval(secs => $1::double precision),
+                       updated_at = now()
+                   WHERE id = (
+                       SELECT id FROM extraction_jobs
+                       WHERE run_after <= now()
+                         AND (status = 'queued'
+                              OR (status = 'running' AND lease_until < now()))
+                       ORDER BY run_after
+                       FOR UPDATE SKIP LOCKED
+                       LIMIT 1
+                   )
+                   RETURNING id, user_id, agent_id, attempts""",
+                float(lease_seconds),
+            )
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "user_id": row["user_id"],
+            "agent_id": row["agent_id"],
+            "attempts": row["attempts"],
+        }
+
+    async def finish_extraction_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        error: Optional[str] = None,
+        retry_in_seconds: Optional[int] = None,
+    ) -> None:
+        """Terminal state, or reschedule when retry_in_seconds is given."""
+        err = (error or None) and str(error)[:500]
+        async with self._pool.acquire() as conn:
+            if retry_in_seconds is not None:
+                await conn.execute(
+                    """UPDATE extraction_jobs SET
+                           status = 'queued',
+                           last_error = $2,
+                           lease_until = NULL,
+                           run_after = now() + make_interval(secs => $3::double precision),
+                           updated_at = now()
+                       WHERE id = $1""",
+                    job_id,
+                    err,
+                    float(retry_in_seconds),
+                )
+                return
+            await conn.execute(
+                """UPDATE extraction_jobs SET
+                       status = $2,
+                       last_error = $3,
+                       lease_until = NULL,
+                       updated_at = now()
+                   WHERE id = $1""",
+                job_id,
+                status,
+                err,
+            )
+
+    async def get_extraction_job(self, job_id: str) -> Optional[dict]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, user_id, agent_id, status, attempts, last_error,
+                          lease_until, run_after
+                   FROM extraction_jobs WHERE id = $1""",
+                job_id,
+            )
+        return dict(row) if row else None
+
+    async def count_extraction_jobs(self, status: str) -> int:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM extraction_jobs WHERE status = $1", status
+            )
+
+    async def count_live_extraction_jobs(self, user_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                """SELECT COUNT(*) FROM extraction_jobs
+                   WHERE user_id = $1 AND status IN ('queued','running')""",
                 user_id,
             )
 

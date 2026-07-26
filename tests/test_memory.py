@@ -5,6 +5,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 
+async def _add_and_drain(engine, uid: str, messages: list[dict]) -> dict:
+    """add() now only queues. Drain synchronously so extraction is assertable."""
+    r = await engine.add(uid, messages)
+    if r["extract_status"] == "queued":
+        return await engine.run_extraction(uid)
+    return r
+
+
 @pytest.mark.asyncio
 async def test_extract_watermark_is_window_max_not_now(engine, monkeypatch):
     """L0 written during extract must remain after watermark (C1)."""
@@ -21,7 +29,8 @@ async def test_extract_watermark_is_window_max_not_now(engine, monkeypatch):
     monkeypatch.setattr(engine.extractor, "extract_memories", facts)
     monkeypatch.setattr("memory.EXTRACTION_EVERY_N_TURNS", 1)
 
-    r = await engine.add(
+    r = await _add_and_drain(
+        engine,
         uid,
         [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
     )
@@ -54,7 +63,8 @@ async def test_extract_pages_cold_backlog(engine, monkeypatch):
     for i in range(45):
         await engine.storage.save_conversation(uid, "user", f"seed-user-{i:02d}")
 
-    r = await engine.add(
+    r = await _add_and_drain(
+        engine,
         uid,
         [{"role": "user", "content": "trigger"}, {"role": "assistant", "content": "ok"}],
     )
@@ -65,14 +75,97 @@ async def test_extract_pages_cold_backlog(engine, monkeypatch):
     assert "trigger" in blob
     state = await engine.storage.get_extraction_state(uid)
     leftover = await engine.storage.get_conversations_since(
-        uid, since=state["last_extraction_at"], limit=50
+        uid,
+        since=state["last_extraction_at"],
+        limit=50,
+        after_id=state.get("last_extraction_id"),
     )
     assert leftover == []
 
 
 async def _trust_ready(engine, uid: str) -> None:
-    """Mark extract OK so seeded L1 is searchable under empty-when-untrusted policy."""
+    """Mark extract OK so seeded L1 reads as caught-up (stale=false) recall."""
     await engine.storage.mark_extraction_success(uid)
+
+
+def test_recency_multiplier_newer_higher():
+    from memory import _recency_multiplier
+
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=60)
+    m_new = _recency_multiplier(now, half_life_days=30)
+    m_old = _recency_multiplier(old, half_life_days=30)
+    assert m_new > m_old
+    assert _recency_multiplier(now, half_life_days=0) == 1.0
+
+
+def test_conflict_demotes_older_duplicate():
+    from memory import _apply_recency_and_conflict
+
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            "id": "old",
+            "text": "User prefers vim editor daily",
+            "score": 1.0,
+            "created_at": now - timedelta(days=90),
+            "metadata": {},
+        },
+        {
+            "id": "new",
+            "text": "User prefers neovim editor daily",
+            "score": 1.0,
+            "created_at": now,
+            "metadata": {},
+        },
+    ]
+    out = _apply_recency_and_conflict(
+        rows, half_life_days=0, jaccard_thresh=0.3, demote=0.5
+    )
+    by_id = {r["id"]: r for r in out}
+    assert by_id["new"]["score"] > by_id["old"]["score"]
+    assert by_id["old"]["metadata"].get("_conflict_demoted") is True
+    assert by_id["old"]["metadata"].get("_superseded_by") == "new"
+    assert out[0]["id"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_search_prefers_newer_on_conflict(engine, monkeypatch):
+    uid = "test-recency-conflict"
+    emb = engine.embedder.embed(["x"])[0]
+    monkeypatch.setattr("memory.RECALL_STRATEGY", "keyword")
+    monkeypatch.setattr("memory.RECALL_RECENCY_HALF_LIFE_DAYS", 0)
+    monkeypatch.setattr("memory.RECALL_CONFLICT_JACCARD", 0.3)
+    monkeypatch.setattr("memory.RECALL_CONFLICT_DEMOTE", 0.5)
+
+    old_id = await engine.storage.save_memory(
+        uid, "User prefers the vim text editor", emb, priority=50
+    )
+    new_id = await engine.storage.save_memory(
+        uid, "User prefers the neovim text editor", emb, priority=50
+    )
+    # Backdate older row so conflict demote can see age.
+    async with engine.storage._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE memories SET created_at = $2 WHERE id = $1",
+            old_id,
+            datetime.now(timezone.utc) - timedelta(days=60),
+        )
+        await conn.execute(
+            "UPDATE memories SET created_at = $2 WHERE id = $1",
+            new_id,
+            datetime.now(timezone.utc),
+        )
+    await _trust_ready(engine, uid)
+
+    results = (await engine.search(uid, "editor prefers", top_k=5))["results"]
+    texts = [r["text"] for r in results]
+    assert any("neovim" in t for t in texts)
+    if any("vim" in t and "neovim" not in t for t in texts):
+        # Older near-dup still returned (ADD-only) but ranked below newer.
+        vim_i = next(i for i, t in enumerate(texts) if "vim" in t and "neovim" not in t)
+        neo_i = next(i for i, t in enumerate(texts) if "neovim" in t)
+        assert neo_i < vim_i
 
 
 @pytest.mark.asyncio
@@ -189,7 +282,8 @@ async def test_trust_after_successful_extract(engine, monkeypatch):
 
     monkeypatch.setattr(engine.extractor, "extract_memories", facts)
     monkeypatch.setattr("memory.EXTRACTION_EVERY_N_TURNS", 1)
-    r = await engine.add(
+    r = await _add_and_drain(
+        engine,
         uid,
         [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
     )
@@ -306,14 +400,70 @@ async def test_user_id_canonicalized(engine):
 
 
 @pytest.mark.asyncio
-async def test_untrusted_search_returns_empty(engine):
-    uid = "test-untrusted-empty"
+async def test_untrusted_search_serves_stale_not_empty(engine):
+    """Degraded recall: untrusted serves real L1 with a loud banner, never amnesia."""
+    uid = "test-untrusted-stale"
     emb = engine.embedder.embed(["x"])[0]
-    await engine.storage.save_memory(uid, "Should not surface when untrusted", emb)
-    # L1 present but no successful extract → untrusted
+    await engine.storage.save_memory(uid, "Should still surface when stale", emb)
+    # L1 present but no successful extract → untrusted, yet results must flow.
     payload = await engine.search(uid, "surface", top_k=5)
-    assert payload["results"] == []
     assert payload["trust"]["recall_trusted"] is False
+    assert payload["stale"] is True
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["text"] == "Should still surface when stale"
+
+
+@pytest.mark.asyncio
+async def test_failed_extract_still_serves_recall(engine):
+    """A single LLM failure must not latch recall off."""
+    uid = "test-stale-failed"
+    emb = engine.embedder.embed(["x"])[0]
+    await engine.storage.save_memory(uid, "Survives an extract failure", emb)
+    await engine.storage.mark_extraction_success(uid)
+    await engine.storage.mark_extraction_failure(uid, "llm exploded")
+
+    payload = await engine.search(uid, "survives", top_k=5)
+    assert payload["stale"] is True
+    assert len(payload["results"]) == 1
+    assert payload["trust"]["last_extract_error"] == "llm exploded"
+
+
+@pytest.mark.asyncio
+async def test_no_l1_is_hard_empty(engine):
+    """Nothing to serve is still empty — degraded mode does not invent rows."""
+    uid = "test-stale-nol1"
+    await engine.storage.save_conversation(uid, "user", "hello")
+    payload = await engine.search(uid, "hello", top_k=5)
+    assert payload["results"] == []
+    assert payload["stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_stale_seconds_measures_unmined_l0(engine):
+    uid = "test-stale-secs"
+    emb = engine.embedder.embed(["x"])[0]
+    await engine.storage.save_memory(uid, "anything", emb)
+    # Watermark 2h behind the newest L0 row.
+    await engine.storage.save_conversation(uid, "user", "recent turn")
+    await engine.storage.mark_extraction_success(
+        uid, watermark_at=datetime.now(timezone.utc) - timedelta(hours=2)
+    )
+    trust = await engine.memory_trust(uid)
+    assert 7000 < trust["stale_seconds"] < 7400
+
+    payload = await engine.search(uid, "anything", top_k=5)
+    assert payload["stale_seconds"] == trust["stale_seconds"]
+
+
+@pytest.mark.asyncio
+async def test_caught_up_is_not_stale(engine):
+    uid = "test-stale-caughtup"
+    emb = engine.embedder.embed(["x"])[0]
+    await engine.storage.save_memory(uid, "caught up fact", emb)
+    await engine.storage.mark_extraction_success(uid)
+    payload = await engine.search(uid, "caught", top_k=5)
+    assert payload["stale"] is False
+    assert payload["stale_seconds"] == 0
 
 
 @pytest.mark.asyncio
@@ -327,7 +477,8 @@ async def test_empty_window_keeps_prior_watermark(engine, monkeypatch):
         return []
 
     monkeypatch.setattr(engine.storage, "get_conversations_since", no_pending)
-    r = await engine.add(
+    r = await _add_and_drain(
+        engine,
         uid,
         [{"role": "user", "content": "ping"}, {"role": "assistant", "content": "pong"}],
     )
@@ -408,17 +559,17 @@ async def test_add_counts_user_turns(engine, monkeypatch):
     ]
 
     # 2 user turns — below threshold
-    await engine.add(uid, pair(1))
-    await engine.add(uid, pair(2))
+    await _add_and_drain(engine, uid, pair(1))
+    await _add_and_drain(engine, uid, pair(2))
     assert calls["n"] == 0
 
     # 3rd user turn triggers extract once
-    r3 = await engine.add(uid, pair(3))
+    r3 = await _add_and_drain(engine, uid, pair(3))
     assert calls["n"] == 1
     assert r3["extract_status"] == "ok"
 
     # Assistant-only does not bump / extract
-    await engine.add(uid, [{"role": "assistant", "content": "lonely assistant"}])
+    await _add_and_drain(engine, uid, [{"role": "assistant", "content": "lonely assistant"}])
     assert calls["n"] == 1
 
 
@@ -441,14 +592,19 @@ async def test_extract_failure_does_not_reset_counter(engine, monkeypatch):
     r1 = await engine.add(uid, pair(1))
     assert r1["extract_status"] == "skipped"
     r2 = await engine.add(uid, pair(2))
+    assert r2["extract_status"] == "queued"
+    # run_extraction raises so the queue can retry; state must stay due.
+    with pytest.raises(RuntimeError):
+        await engine.run_extraction(uid)
     assert calls["n"] == 1
-    assert r2["extract_status"] == "failed"
     state = await engine.storage.get_extraction_state(uid)
     assert state["conversations_seen"] == 2  # not reset
     assert state["last_extract_ok"] is False
 
     # Next turn retries because counter still due
     await engine.add(uid, pair(3))
+    with pytest.raises(RuntimeError):
+        await engine.run_extraction(uid)
     assert calls["n"] == 2
 
 
@@ -460,7 +616,8 @@ async def test_extract_empty_facts_resets_counter(engine, monkeypatch):
 
     monkeypatch.setattr(engine.extractor, "extract_memories", none_facts)
     monkeypatch.setattr("memory.EXTRACTION_EVERY_N_TURNS", 1)
-    r = await engine.add(
+    r = await _add_and_drain(
+        engine,
         uid,
         [{"role": "user", "content": "hello only"}, {"role": "assistant", "content": "hi"}],
     )
@@ -583,7 +740,8 @@ async def test_cold_extract_does_not_orphan_past_window(engine, monkeypatch):
         await engine.storage.save_conversation(uid, "user", f"seed-user-{i:03d}")
         await engine.storage.save_conversation(uid, "assistant", f"seed-asst-{i:03d}")
 
-    r = await engine.add(
+    r = await _add_and_drain(
+        engine,
         uid,
         [
             {"role": "user", "content": "trigger-extract"},
@@ -609,6 +767,167 @@ async def test_cold_extract_does_not_orphan_past_window(engine, monkeypatch):
     # Equal or slightly behind latest is fine; must not leave rows with
     # created_at > watermark unmined after a successful full catch-up.
     remaining = await engine.storage.get_conversations_since(
-        uid, since=state["last_extraction_at"], limit=500
+        uid,
+        since=state["last_extraction_at"],
+        limit=500,
+        after_id=state.get("last_extraction_id"),
     )
     assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_extract_mid_pagination_failure_retries_remainder(engine, monkeypatch):
+    """Page1 success must not zero cadence; page2 fail must re-mine remainder next add."""
+    uid = "test-mid-page-fail"
+    calls = {"n": 0, "texts": []}
+
+    async def facts_then_boom(messages_text, existing_memories=None):
+        calls["n"] += 1
+        calls["texts"].append(messages_text)
+        if calls["n"] == 1:
+            return [{"content": "fact-page-1", "type": "episodic", "priority": 50}]
+        if calls["n"] == 2:
+            raise RuntimeError("llm down mid-pagination")
+        return [{"content": f"fact-page-{calls['n']}", "type": "episodic", "priority": 50}]
+
+    monkeypatch.setattr(engine.extractor, "extract_memories", facts_then_boom)
+    monkeypatch.setattr("memory.EXTRACTION_EVERY_N_TURNS", 1)
+
+    # cold_limit=40 → seed 50 user L0 so page2 is required.
+    n_seed = 50
+    for i in range(n_seed):
+        await engine.storage.save_conversation(uid, "user", f"seed-user-{i:03d}")
+
+    await engine.add(
+        uid,
+        [
+            {"role": "user", "content": "trigger-1"},
+            {"role": "assistant", "content": "ok"},
+        ],
+    )
+    with pytest.raises(RuntimeError):
+        await engine.run_extraction(uid)
+    assert calls["n"] == 2
+    state1 = await engine.storage.get_extraction_state(uid)
+    assert state1["last_extract_ok"] is False
+    # Intermediate advance keeps counter due (not zeroed by page1 success).
+    assert state1["conversations_seen"] >= 1
+    assert state1["last_extraction_at"] is not None
+    assert state1["last_extraction_id"] is not None
+
+    r2 = await _add_and_drain(
+        engine,
+        uid,
+        [
+            {"role": "user", "content": "trigger-2"},
+            {"role": "assistant", "content": "ok"},
+        ],
+    )
+    assert r2["extract_status"] in ("ok", "ok_no_facts")
+    assert calls["n"] >= 3
+
+    blob = "\n".join(calls["texts"])
+    # Remainder of cold backlog must appear on retry (not only failure flags).
+    assert "seed-user-049" in blob
+    assert "trigger-2" in blob
+
+    state2 = await engine.storage.get_extraction_state(uid)
+    assert state2["last_extract_ok"] is True
+    assert state2["conversations_seen"] == 0
+    leftover = await engine.storage.get_conversations_since(
+        uid,
+        since=state2["last_extraction_at"],
+        limit=500,
+        after_id=state2.get("last_extraction_id"),
+    )
+    assert leftover == []
+
+
+@pytest.mark.asyncio
+async def test_extract_equal_ts_keyset_survives_mid_fail(engine, monkeypatch):
+    """Durable last_extraction_id drains same-timestamp L0 across crash/resume."""
+    uid = "test-equal-ts-keyset"
+    calls = {"n": 0, "texts": []}
+    fixed_ts = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    async def facts_then_boom(messages_text, existing_memories=None):
+        calls["n"] += 1
+        calls["texts"].append(messages_text)
+        if calls["n"] == 1:
+            return [{"content": "fact-eq-1", "type": "episodic", "priority": 50}]
+        if calls["n"] == 2:
+            raise RuntimeError("crash after page1")
+        return [{"content": f"fact-eq-{calls['n']}", "type": "episodic", "priority": 50}]
+
+    monkeypatch.setattr(engine.extractor, "extract_memories", facts_then_boom)
+    monkeypatch.setattr("memory.EXTRACTION_EVERY_N_TURNS", 1)
+
+    # 45 rows share one created_at so created_at-only resume would orphan the tail.
+    n_seed = 45
+    for i in range(n_seed):
+        rid = await engine.storage.save_conversation(uid, "user", f"eq-user-{i:03d}")
+        async with engine.storage._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE conversations SET created_at = $2 WHERE id = $1",
+                rid,
+                fixed_ts,
+            )
+
+    await engine.add(
+        uid,
+        [
+            {"role": "user", "content": "eq-trigger-1"},
+            {"role": "assistant", "content": "ok"},
+        ],
+    )
+    with pytest.raises(RuntimeError):
+        await engine.run_extraction(uid)
+    state1 = await engine.storage.get_extraction_state(uid)
+    assert state1["last_extraction_id"] is not None
+    # created_at-only resume skips same-ts siblings; keyset must still see them.
+    bare = await engine.storage.get_conversations_since(
+        uid, since=state1["last_extraction_at"], limit=500
+    )
+    keyed = await engine.storage.get_conversations_since(
+        uid,
+        since=state1["last_extraction_at"],
+        limit=500,
+        after_id=state1["last_extraction_id"],
+    )
+    bare_eq = [c for c in bare if c["content"].startswith("eq-user-")]
+    keyed_eq = [c for c in keyed if c["content"].startswith("eq-user-")]
+    assert bare_eq == []
+    assert len(keyed_eq) > 0
+
+    r2 = await _add_and_drain(
+        engine,
+        uid,
+        [
+            {"role": "user", "content": "eq-trigger-2"},
+            {"role": "assistant", "content": "ok"},
+        ],
+    )
+    assert r2["extract_status"] in ("ok", "ok_no_facts")
+    blob = "\n".join(calls["texts"])
+    # UUID id order ≠ insert order; require full equal-ts set across pages.
+    for i in range(n_seed):
+        assert f"eq-user-{i:03d}" in blob
+    # At least one equal-ts row only appears after the failed page (retry path).
+    page1_blob = calls["texts"][0]
+    rest_blob = "\n".join(calls["texts"][1:])
+    only_after = [
+        f"eq-user-{i:03d}"
+        for i in range(n_seed)
+        if f"eq-user-{i:03d}" not in page1_blob
+    ]
+    assert only_after, "expected some equal-ts rows beyond cold_limit page1"
+    assert any(m in rest_blob for m in only_after)
+
+    state2 = await engine.storage.get_extraction_state(uid)
+    leftover = await engine.storage.get_conversations_since(
+        uid,
+        since=state2["last_extraction_at"],
+        limit=500,
+        after_id=state2.get("last_extraction_id"),
+    )
+    assert leftover == []

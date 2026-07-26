@@ -42,12 +42,30 @@ EXTRACTION_MAX_MEMORIES = int(os.getenv("EXTRACTION_MAX_MEMORIES", "20"))
 EXTRACTION_MAX_LAG_SECONDS = int(os.getenv("EXTRACTION_MAX_LAG_SECONDS", "3600"))
 PERSONA_EVERY_N_MEMORIES = int(os.getenv("PERSONA_EVERY_N_MEMORIES", "50"))
 
+# Extraction runs on a durable queue, off the request path. The worker leases a
+# job; a crashed lease is reclaimed after it expires (never held across an LLM call).
+EXTRACTION_WORKER_ENABLED = os.getenv("EXTRACTION_WORKER_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+EXTRACTION_JOB_MAX_ATTEMPTS = int(os.getenv("EXTRACTION_JOB_MAX_ATTEMPTS", "5"))
+EXTRACTION_LEASE_SECONDS = int(os.getenv("EXTRACTION_LEASE_SECONDS", "600"))
+EXTRACTION_POLL_SECONDS = float(os.getenv("EXTRACTION_POLL_SECONDS", "1"))
+EXTRACTION_RETRY_BACKOFF_SECONDS = int(
+    os.getenv("EXTRACTION_RETRY_BACKOFF_SECONDS", "30")
+)
+
 RECALL_STRATEGY = os.getenv("RECALL_STRATEGY", "hybrid")
 RECALL_MAX_RESULTS = int(os.getenv("RECALL_MAX_RESULTS", "10"))
 RECALL_SIMILARITY_THRESHOLD = float(os.getenv("RECALL_SIMILARITY_THRESHOLD", "0.3"))
 # Unused with RRF (rank-based fusion); kept for env compat only.
 RECALL_KEYWORD_WEIGHT = float(os.getenv("RECALL_KEYWORD_WEIGHT", "0.3"))
 RECALL_RRF_K = int(os.getenv("RECALL_RRF_K", "60"))
+# Mild newer-wins on recall (ADD-only store). 0 disables recency/conflict tilt.
+RECALL_RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECALL_RECENCY_HALF_LIFE_DAYS", "30"))
+RECALL_CONFLICT_JACCARD = float(os.getenv("RECALL_CONFLICT_JACCARD", "0.4"))
+RECALL_CONFLICT_DEMOTE = float(os.getenv("RECALL_CONFLICT_DEMOTE", "0.82"))
 
 # Door: shared secret for HTTP (header X-Memory-Key). Empty = auth off (local tests).
 MEMORY_API_SECRET = (os.getenv("MEMORY_API_SECRET") or "").strip()

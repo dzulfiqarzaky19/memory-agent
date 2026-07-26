@@ -38,7 +38,26 @@ def _trust_banner(trust: dict | None) -> str:
         f"behind_watermark={trust.get('behind_watermark')} "
         f"extraction_lag_exceeded={trust.get('extraction_lag_exceeded')} "
         f"extraction_due={trust.get('extraction_due')} "
+        f"stale_seconds={trust.get('stale_seconds')} "
         f"recall_trusted={trust.get('recall_trusted')}]"
+    )
+
+
+def _stale_note(data: dict) -> str:
+    """Loud staleness line — results are real but may lag the newest turns."""
+    if not data.get("stale"):
+        return ""
+    secs = int(data.get("stale_seconds") or 0)
+    if secs >= 3600:
+        age = f"~{secs // 3600}h"
+    elif secs >= 60:
+        age = f"~{secs // 60}m"
+    else:
+        age = f"{secs}s"
+    return (
+        f"WARNING stale recall (behind by {age}) — extraction is pending or failed. "
+        "Results below are real but may omit the most recent turns; "
+        "do not treat absence as proof the user never said it."
     )
 
 
@@ -55,21 +74,20 @@ async def search_memories(user_id: str, query: str) -> str:
         r.raise_for_status()
         data = r.json()
     banner = _trust_banner(data.get("trust"))
-    if data.get("trust") and not data["trust"].get("recall_trusted"):
-        note = (
-            "Recall untrusted — no atoms returned. "
-            "Do not infer user prefs from empty results "
-            "(extraction lag, failure, or backlog)."
-        )
-        return f"{banner}\n{note}".strip()
+    note = _stale_note(data)
     if not data["results"]:
-        return f"{banner}\nNo relevant memories found.".strip()
+        empty = (
+            "No memories match — and recall is stale, so this is NOT proof the user has no prefs."
+            if data.get("stale")
+            else "No relevant memories found."
+        )
+        return f"{banner}\n{note}\n{empty}".strip()
     lines = [
         f"- [{m['score']:.4f}] ({m.get('type') or 'memory'}) {m['text']}"
         for m in data["results"]
     ]
     body = "Relevant memories:\n" + "\n".join(lines)
-    return f"{banner}\n{body}".strip()
+    return f"{banner}\n{note}\n{body}".strip()
 
 
 @MCP.tool()
@@ -113,9 +131,10 @@ async def get_persona(user_id: str) -> str:
         r.raise_for_status()
         data = r.json()
     banner = _trust_banner(data.get("trust"))
+    note = _stale_note(data)
     if data["memory_count"] == 0:
-        return f"{banner}\nNo memories stored yet.".strip()
-    return f"{banner}\n[{data['memory_count']} memories] {data['summary']}".strip()
+        return f"{banner}\n{note}\nNo memories stored yet.".strip()
+    return f"{banner}\n{note}\n[{data['memory_count']} memories] {data['summary']}".strip()
 
 
 @MCP.tool()

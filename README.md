@@ -195,6 +195,15 @@ curl -H "X-Memory-Key: $MEMORY_API_SECRET" http://127.0.0.1:8000/scenarios/zaky
 - `POST /add` returns `memories_added: 0` most of the time — extraction only fires every N turns. Keep calling `/add` for every assistant response; extraction fires when the counter reaches the threshold. Returns `memory_ids` when extraction fires.
 - `POST /search` returns ranked results from hybrid vector + keyword retrieval with RRF fusion, boosted by scenario matches.
 - `GET /persona/{id}` returns `last_updated` timestamp of the most recent memory used.
+- `/search` and `/persona/{id}` also return `stale` and `stale_seconds`. When extraction is pending or its last run failed, recall still serves real L1 with `stale: true` — degraded, never blank. `stale_seconds` is how far the extraction watermark trails the newest L0 turn.
+
+### `agent_id` is scoping, not isolation
+
+`agent_id` narrows *which* memories a query prefers; it is **not** a security boundary.
+Omitting it is an explicit all-scopes query — an unscoped search returns agent-scoped
+rows too (`agent_id IS NULL OR agent_id = $n`). The MCP tools omit it by design so a
+single user's memories stay visible across hosts. Do not rely on it to separate
+untrusted tenants.
 
 ## How to integrate with any AI agent
 
